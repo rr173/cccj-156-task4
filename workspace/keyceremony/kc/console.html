@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Root Key Ceremony Console</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --line:#27314a; --ink:#d8e0f0;
+          --muted:#8a97b5; --ok:#3fd08a; --warn:#f0b34a; --err:#ef6a6a;
+          --accent:#6aa6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; letter-spacing:.5px; }
+  header span { color:var(--muted); font-size:12px; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:14px; padding:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:14px; min-height:120px; }
+  .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px;
+              color:var(--muted); margin:0 0 10px; }
+  .full { grid-column: 1 / -1; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  td, th { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line);
+           vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px;
+          font-size:11px; border:1px solid var(--line); }
+  .ACTIVE { color:var(--ok); border-color:var(--ok); }
+  .STAGED { color:var(--accent); border-color:var(--accent); }
+  .RETIRING { color:var(--warn); border-color:var(--warn); }
+  .DESTROYED, .ABORTED, .CLOSED, .WITHDRAWN { color:var(--err); border-color:var(--err); }
+  .COMPLETED, .EXECUTED { color:var(--ok); border-color:var(--ok); }
+  .OPEN { color:var(--accent); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
+  input, select, button, textarea { background:#0d1220; color:var(--ink);
+    border:1px solid var(--line); border-radius:7px; padding:7px 10px;
+    font:inherit; }
+  button { cursor:pointer; }
+  button:disabled { color:var(--muted); border-color:var(--line); cursor:not-allowed; }
+  button.primary { border-color:var(--accent); color:var(--accent); }
+  button.approve { border-color:var(--ok); color:var(--ok); }
+  button.danger { border-color:var(--err); color:var(--err); }
+  pre { white-space:pre-wrap; word-break:break-all; max-height:340px;
+        overflow:auto; background:#0c1120; border:1px solid var(--line);
+        border-radius:8px; padding:10px; }
+  #toast { position:fixed; right:16px; bottom:16px; max-width:520px;
+           background:#10182b; border:1px solid var(--line); border-radius:8px;
+           padding:10px 14px; display:none; z-index:9; }
+  #toast.err { border-color:var(--err); color:var(--err); }
+  #toast.ok { border-color:var(--ok); color:var(--ok); }
+  small { color:var(--muted); }
+  .chips span { display:inline-block; margin:2px 4px 2px 0; padding:1px 7px;
+    border:1px solid var(--line); border-radius:999px; font-size:11px;
+    color:var(--muted); }
+  .locked { opacity:.55; }
+  .locked .panel { border-style:dashed; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ROOT KEY CEREMONY CONSOLE</h1>
+  <span>terminal-attested operator sessions · duty-gated reads · four-eyes tickets</span>
+  <span style="margin-left:auto" id="hud"><small>not logged in</small>
+    <button onclick="logout()" id="btnLogout" hidden>logout</button>
+    <button onclick="refreshAll()">refresh</button></span>
+</header>
+
+<main>
+  <!-- ============ login ============ -->
+  <section class="panel full" id="loginPanel">
+    <h2>Operator login · registered terminal attestation</h2>
+    <div class="row">
+      <input id="loginDev" placeholder="terminal id e.g. dev_alice" value="dev_alice"/>
+      <button class="primary" onclick="login()">attest terminal &amp; login</button>
+      <small>issues a one-time challenge; the registered terminal wallet quotes it
+        (measurement + sealing key + timestamp). The token binds person · duty ·
+        terminal · attestation validity.</small>
+    </div>
+  </section>
+
+  <!-- ============ identity / capabilities ============ -->
+  <section class="panel full" id="mePanel" hidden>
+    <h2>Session</h2>
+    <div id="me"><small>—</small></div>
+  </section>
+
+  <!-- ============ tickets ============ -->
+  <section class="panel full" id="ticketPanel" hidden>
+    <h2>Four-eyes authorization tickets</h2>
+    <div id="tickets"><small>loading…</small></div>
+    <h2 style="margin-top:14px">Create ticket</h2>
+    <div class="row">
+      <select id="tOp" onchange="fillTicketHint()">
+        <option value="POLICY_CHANGE">POLICY_CHANGE · modify rule set</option>
+        <option value="ABORT_ACTIVE">ABORT_ACTIVE · terminate round</option>
+        <option value="PUBLISH_GENERATION">PUBLISH_GENERATION · publish new generation</option>
+        <option value="PURGE_RETIRED">PURGE_RETIRED · clear retired material</option>
+      </select>
+    </div>
+    <textarea id="tPayload" rows="4" style="width:100%"></textarea>
+    <div class="row" style="margin-top:6px">
+      <button class="primary" onclick="createTicket()">create / resubmit</button>
+      <small id="tHint"></small>
+    </div>
+    <h2 style="margin-top:10px">Approve / withdraw</h2>
+    <div class="row">
+      <input id="tId" placeholder="ticket_id"/>
+      <button class="approve" onclick="approveTicket()">approve &amp; execute (other person/terminal/duty)</button>
+      <button class="danger" onclick="withdrawTicket()">withdraw (creator)</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Key versions by purpose</h2>
+    <div id="keys"><small>login to view</small></div>
+  </section>
+  <section class="panel">
+    <h2>Ceremonies</h2>
+    <div id="ceremonies"><small>login to view</small></div>
+  </section>
+
+  <section class="panel" id="openPanel">
+    <h2>1 · Open ceremony</h2>
+    <div class="row">
+      <select id="ckind">
+        <option>GENERATE</option><option>ROTATE</option>
+        <option>BACKUP</option><option>DESTROY</option>
+      </select>
+      <input id="cpolicy" placeholder="policy_id" value="pol-root-v1"/>
+      <input id="cpurpose" placeholder="purpose" value="root-signing"/>
+      <input id="ctarget" placeholder="target_version (DESTROY only)"/>
+    </div>
+    <button class="primary" data-cap="ceremony:open" onclick="openCeremony()">open</button>
+  </section>
+
+  <section class="panel" id="drivePanel">
+    <h2>2 · Drive a ceremony (your bound terminal only)</h2>
+    <div class="row">
+      <input id="cid" placeholder="ceremony_id"/>
+      <input id="did" placeholder="device_id (must equal session terminal)"/>
+    </div>
+    <div class="row">
+      <button data-cap="device:step" onclick="step('attest')">attest</button>
+      <button data-cap="device:step" onclick="step('receive')">receive+verify share</button>
+      <button data-cap="device:step" onclick="step('confirm')">confirm</button>
+      <button data-cap="device:step" onclick="step('submit-share')">submit recovery share</button>
+      <button data-cap="ceremony:open" onclick="commitStep()">commit</button>
+    </div>
+    <small>abort, publish and DESTROY-commit (purge) are four-eyes gated: create
+      the matching ticket above and have a complementary duty approve it.</small>
+  </section>
+
+  <section class="panel" id="signPanel">
+    <h2>3 · Signing test (signers use ACTIVE only)</h2>
+    <div class="row">
+      <input id="spurpose" value="root-signing" style="width:160px"/>
+      <input id="msg" value="canonical test message" style="flex:1"/>
+    </div>
+    <div class="row">
+      <button class="primary" data-cap="sign:use" onclick="doSign()">sign</button>
+      <button onclick="doVerify()">verify (accepts historical versions)</button>
+    </div>
+    <pre id="sigout" hidden></pre>
+  </section>
+
+  <section class="panel" id="enrollPanel">
+    <h2>Enrollment / terminal administration</h2>
+    <div class="row">
+      <input id="ppid" placeholder="participant_id"/>
+      <input id="pname" placeholder="display name"/>
+      <select id="prole">
+        <option>ROOT_OWNER</option><option>KEY_STEWARD</option>
+        <option>WITNESS_SHAREHOLDER</option><option>ENCLAVE_OPERATOR</option>
+      </select>
+      <button data-cap="participant:enroll" onclick="enroll()">enroll + provision terminal</button>
+    </div>
+    <div class="row">
+      <input id="revDid" placeholder="device_id to revoke"/>
+      <button class="danger" data-cap="device:revoke" onclick="revokeDevice()">revoke terminal</button>
+    </div>
+  </section>
+
+  <section class="panel full" id="auditPanel">
+    <h2>Audit trail / export verification</h2>
+    <div class="row">
+      <button data-read="audit" onclick="loadAudit()">audit</button>
+      <button data-read="export" onclick="doExport()">export bundle</button>
+    </div>
+    <pre id="audit"><small>audit/export are released by duty</small></pre>
+  </section>
+
+  <!-- ============ cross-region DR drills ============ -->
+  <section class="panel full" id="drillPanel" hidden>
+    <h2>Cross-region disaster recovery drills</h2>
+    <div class="row">
+      <button data-cap="drill:plan" onclick="loadDrills()">refresh drills</button>
+      <small>repeatable, isolated-region rebuilds · root material never unsealed ·
+        writes never mirrored · time-boxed failover lease on read-only ingress</small>
+    </div>
+    <h2>1 · Region / recovery-point setup</h2>
+    <div class="row">
+      <input id="drRegion" placeholder="region name" value="us-east"/>
+      <label><input type="checkbox" id="drIsolated"/> isolated</label>
+      <input id="drCapacity" placeholder="capacity bytes" value="1073741824"
+             style="width:150px"/>
+      <button data-cap="drill:plan" onclick="drDefineRegion()">define region</button>
+    </div>
+    <div class="row">
+      <input id="drRp" placeholder="recovery_point id" value="rp-1"/>
+      <input id="drObjKeys" placeholder="object keys, comma separated"
+             style="flex:1"
+             value="prod/keywrap-1.bin,prod/pubkeys.json,prod/audit.log,prod/index.json,prod/policy.json"/>
+      <button data-cap="drill:plan" onclick="drRecoveryPoint()">create recovery point</button>
+    </div>
+    <h2>2 · Plan (optimistic revisions)</h2>
+    <div class="row">
+      <input id="drPlanId" placeholder="plan_id (blank = create)"/>
+      <input id="drRev" placeholder="base_revision" value="1" style="width:120px"/>
+      <input id="drLabel" placeholder="label" value="quarterly drill"/>
+      <input id="drSrc" placeholder="source" value="us-east"/>
+      <input id="drTgt" placeholder="isolated target" value="eu-west-airgap"/>
+    </div>
+    <div class="row">
+      <input id="drRto" placeholder="rto_s" value="300" style="width:90px"/>
+      <input id="drRpo" placeholder="rpo_s" value="3600" style="width:90px"/>
+      <input id="drRatio" placeholder="mirror_ratio" value="0.1"
+             style="width:100px"/>
+      <input id="drCats" placeholder="categories" style="flex:1"
+             value="key_material,public_keys,audit,index,policy"/>
+    </div>
+    <div class="row">
+      <button data-cap="drill:plan" class="primary" onclick="drSavePlan()">save / revise plan</button>
+      <button data-cap="drill:scan" onclick="drScan()">checklist scan → blueprint</button>
+      <button data-cap="drill:run" onclick="drStart()">start drill (short-lived creds)</button>
+    </div>
+    <h2>3 · Run / observe / fail over</h2>
+    <div class="row">
+      <input id="drillId" placeholder="drill_id"/>
+      <button data-cap="drill:run" onclick="drStage()">run-to-ready</button>
+      <button data-cap="drill:mirror" onclick="drWindow(true)">open window</button>
+      <button data-cap="drill:mirror" onclick="drWindow(false)">close window</button>
+    </div>
+    <div class="row">
+      <input id="drReq" placeholder='read request JSON' style="flex:1"
+             value='{"operation":"VERIFY","key":"prod/pubkeys.json","request_id":"r1"}'/>
+      <button data-cap="drill:mirror" onclick="drMirror()">mirror read</button>
+      <button data-cap="drill:mirror" class="danger" onclick="drResume()">resume after repair</button>
+    </div>
+    <div class="row">
+      <input id="drInstance" placeholder="control instance" value="web-console"/>
+      <button data-cap="drill:lease" class="approve" onclick="drLease()">acquire failover lease</button>
+      <button data-cap="drill:failback" onclick="drFailback()">failback</button>
+      <button data-cap="drill:terminate" onclick="drArchiveDiffs()">archive diffs</button>
+      <button data-cap="drill:terminate" class="danger" onclick="drTerminate()">terminate + cleanup</button>
+    </div>
+    <div id="drillsView"><small>no drills loaded</small></div>
+    <pre id="drillOut" hidden></pre>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+let ME = null;
+let TICKETS = [];
+let LAST_SIG = null;
+
+function toast(t, cls) {
+  const e = document.getElementById("toast");
+  e.textContent = t; e.className = cls || ""; e.style.display = "block";
+  setTimeout(() => e.style.display = "none", 5000);
+}
+
+async function api(path, method, body) {
+  const opt = { method: method || "GET", headers: {"Content-Type":"application/json"} };
+  const tok = localStorage.getItem("kc_token");
+  if (tok) opt.headers["Authorization"] = "Bearer " + tok;
+  if (body) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = Object.assign(new Error(j.message || r.statusText), j);
+    err.status = r.status;
+    throw err;
+  }
+  return j;
+}
+
+// ---------------- login / session ----------------
+async function login() {
+  const did = document.getElementById("loginDev").value.trim();
+  try {
+    await api("/api/session/login-challenge", "POST", {device_id: did});
+    const j = await api("/api/session/login", "POST", {device_id: did});
+    localStorage.setItem("kc_token", j.token);
+    toast("logged in as " + j.participant_id + " / " + j.role
+          + " @ " + j.device_id, "ok");
+    await boot(true);
+  } catch (e) { toast(e.message, "err"); }
+}
+async function logout() {
+  try { await api("/api/session/logout", "POST", {}); } catch (e) {}
+  localStorage.removeItem("kc_token");
+  ME = null;
+  applySession(null);
+  toast("logged out");
+}
+
+function applySession(me) {
+  ME = me;
+  const logged = !!me;
+  document.getElementById("loginPanel").hidden = logged;
+  document.getElementById("mePanel").hidden = !logged;
+  document.getElementById("ticketPanel").hidden = !logged;
+  document.getElementById("drillPanel").hidden = !logged;
+  document.getElementById("btnLogout").hidden = !logged;
+  document.querySelector("main").classList.toggle("locked", !logged);
+  document.getElementById("hud").firstElementChild.textContent = logged
+    ? `${me.participant_id} (${me.role}) @ ${me.device_id} · until ${new Date(me.expires_at*1000).toLocaleTimeString()}`
+    : "not logged in";
+  if (logged) {
+    const caps = new Set(me.capabilities);
+    const reads = new Set(me.read_scopes);
+    document.getElementById("me").innerHTML = renderMe(me);
+    document.querySelectorAll("[data-cap]").forEach(b => {
+      b.disabled = !caps.has(b.dataset.cap);
+    });
+    document.querySelectorAll("[data-read]").forEach(b => {
+      b.disabled = !reads.has(b.dataset.read);
+    });
+    const did = document.getElementById("did");
+    if (!did.value) did.value = me.device_id;
+  } else {
+    document.getElementById("keys").innerHTML = "<small>login to view</small>";
+    document.getElementById("ceremonies").innerHTML = "<small>login to view</small>";
+    document.getElementById("tickets").innerHTML = "<small>—</small>";
+  }
+}
+
+function renderMe(me) {
+  return `<table>
+    <tr><th>person</th><td>${me.participant_id} — ${me.name}</td>
+        <th>duty</th><td>${me.role}</td></tr>
+    <tr><th>terminal</th><td>${me.device_id}</td>
+        <th>attestation</th><td>meas ${me.measurement.slice(0,16)}… · quote ts ${me.quote_ts}</td></tr>
+    <tr><th>token id</th><td><small>${me.token_id}</small></td>
+        <th>expires</th><td>${new Date(me.expires_at*1000).toLocaleString()}</td></tr>
+  </table>
+  <div class="chips" style="margin-top:6px"><b>read scopes:</b>
+    ${me.read_scopes.map(s=>`<span>${s}</span>`).join("")}</div>
+  <div class="chips"><b>actions:</b>
+    ${me.capabilities.map(s=>`<span>${s}</span>`).join("")}</div>
+  <div class="chips"><b>can create ticket for:</b>
+    ${Object.keys(me.creator_duties).map(o=>`<span>${o}</span>`).join("")||"<small>none</small>"}</div>
+  <div class="chips"><b>can approve ticket for:</b>
+    ${Object.keys(me.approver_duties).map(o=>`<span>${o}</span>`).join("")||"<small>none</small>"}</div>`;
+}
+
+// ---------------- tickets ----------------
+const TICKET_HINTS = {
+  POLICY_CHANGE: '{"policy_id":"pol-root-v2","label":"…","threshold":3,"slots":[["alice","ROOT_OWNER","dev_alice"],…]}',
+  ABORT_ACTIVE: '{"ceremony_id":"cer_…","reason":"…"}',
+  PUBLISH_GENERATION: '{"ceremony_id":"cer_…","expected_active":"kv_…"}',
+  PURGE_RETIRED: '{"ceremony_id":"cer_…"}'
+};
+function fillTicketHint() {
+  document.getElementById("tPayload").placeholder =
+    TICKET_HINTS[document.getElementById("tOp").value];
+}
+async function createTicket() {
+  const op = document.getElementById("tOp").value;
+  let payload = {};
+  const txt = document.getElementById("tPayload").value.trim();
+  if (txt) { try { payload = JSON.parse(txt); } catch(e){ return toast("payload is not JSON", "err"); } }
+  if (op === "ABORT_ACTIVE" && document.getElementById("cid").value)
+    payload.ceremony_id ??= document.getElementById("cid").value;
+  try {
+    const j = await api("/api/tickets", "POST", {operation: op, payload});
+    document.getElementById("tId").value = j.ticket.id;
+    toast((j.duplicate ? "returned existing ticket " : "created ticket ") + j.ticket.id,
+          "ok");
+    await loadTickets();
+  } catch (e) { toast(e.message, "err"); }
+}
+async function approveTicket() {
+  const id = document.getElementById("tId").value.trim();
+  try {
+    const j = await api("/api/tickets/approve", "POST", {ticket_id: id});
+    toast("approved+executed " + j.ticket.id + " → " + j.ticket.status, "ok");
+    await refreshAll();
+  } catch (e) {
+    toast(`${e.error||"ERROR"}: ${e.message}`, "err");
+    await loadTickets(); refreshViews();
+  }
+}
+async function withdrawTicket() {
+  const id = document.getElementById("tId").value.trim();
+  try {
+    const j = await api("/api/tickets/withdraw", "POST", {ticket_id: id});
+    toast("withdrawn " + j.ticket.id, "ok"); loadTickets();
+  } catch (e) { toast(e.message, "err"); }
+}
+async function loadTickets() {
+  try {
+    const j = await api("/api/tickets");
+    TICKETS = j.tickets;
+    document.getElementById("tickets").innerHTML = renderTickets(j.tickets);
+  } catch (e) { /* duty may not read tickets */ }
+}
+function renderTickets(ts) {
+  if (!ts.length) return "<small>no tickets</small>";
+  return `<table><tr><th>id</th><th>operation</th><th>status</th><th>creator</th>
+    <th>approver</th><th>deadline</th><th>digest</th><th>chain</th></tr>
+    ${ts.slice().reverse().map(t => `<tr>
+      <td><small><a href="#" onclick="document.getElementById('tId').value='${t.id}';return false">${t.id}</a></small></td>
+      <td>${t.operation}</td>
+      <td>${pill(t.status)}${t.closed_reason?`<br><small class="CLOSED">${t.closed_reason}</small>`:""}</td>
+      <td>${t.creator.participant_id}<br><small>${t.creator.role} · ${t.creator.device_id}</small></td>
+      <td>${t.approver ? `${t.approver.participant_id}<br><small>${t.approver.role} · ${t.approver.device_id}</small>`:"—"}</td>
+      <td><small>${new Date(t.deadline*1000).toLocaleTimeString()}</small></td>
+      <td><small>${t.digest.slice(0,12)}…</small></td>
+      <td><small>${t.decision_chain.map(d=>d.type).join(" → ")}${t.execution?` → ${JSON.stringify(t.execution.result).slice(0,60)}`:""}</small></td>
+    </tr>`).join("")}</table>`;
+}
+
+// ---------------- views ----------------
+function pill(s) { return s ? `<span class="pill ${s}">${s}</span>` : ""; }
+async function refreshViews() {
+  if (!ME) return;
+  try {
+    const k = await api("/api/keys");
+    document.getElementById("keys").innerHTML = renderKeys(k);
+  } catch (e) { document.getElementById("keys").innerHTML =
+    `<small class="CLOSED">keys view denied to duty ${ME.role}</small>`; }
+  try {
+    const c = await api("/api/ceremonies");
+    document.getElementById("ceremonies").innerHTML = renderCeremonies(c);
+  } catch (e) {}
+}
+function renderKeys(k) {
+  if (!k.keys.length) return "<small>no keys yet</small>";
+  const by = {};
+  for (const x of k.keys) (by[x.purpose] ??= []).push(x);
+  return Object.entries(by).map(([purpose, list]) => `
+    <div><b>${purpose}</b> <small>current: ${k.purposes[purpose] || "—"}</small>
+    <table><tr><th>ver</th><th>status</th><th>fingerprint</th><th>id</th></tr>
+    ${list.map(x => `<tr><td>${x.version}</td><td>${pill(x.status)}</td>
+      <td>${x.fingerprint}</td><td><small>${x.id}</small></td></tr>`).join("")}
+    </table></div>`).join("");
+}
+function renderCeremonies(c) {
+  if (!c.ceremonies.length) return "<small>no ceremonies</small>";
+  return `<table><tr><th>id</th><th>kind</th><th>purpose</th><th>stage</th>
+    <th>status</th><th>attested/confirmed</th></tr>
+    ${c.ceremonies.map(x => {
+      const parts = Object.values(x.participants);
+      const a = parts.filter(p => p.attested).length;
+      const cf = x.confirmations.length;
+      return `<tr><td><small><a href="#" onclick="document.getElementById('cid').value='${x.id}';return false">${x.id}</a></small></td>
+        <td>${x.kind}</td><td>${x.purpose}</td><td>${x.stage}</td><td>${pill(x.status)}</td>
+        <td>${a}/${parts.length} · ${cf} confirmed
+        ${x.abort ? `<br><small class="ABORTED">aborted: ${x.abort.reason}</small>`:""}
+        ${x.published ? `<br><small>published</small>`:""}</td></tr>`;
+    }).join("")}</table>`;
+}
+async function refreshAll() {
+  if (!localStorage.getItem("kc_token")) { applySession(null); return; }
+  await boot(false);
+}
+
+// ---------------- ceremony actions ----------------
+async function openCeremony() {
+  try {
+    const tv = document.getElementById("ctarget").value;
+    const j = await api("/api/ceremonies/open", "POST", {
+      kind: document.getElementById("ckind").value,
+      policy_id: document.getElementById("cpolicy").value,
+      purpose: document.getElementById("cpurpose").value,
+      target_version: tv || null});
+    document.getElementById("cid").value = j.id;
+    if (j.kind === "ROTATE") document.getElementById("cpurpose");
+    toast("opened " + j.id, "ok"); refreshViews();
+  } catch (e) { toast(e.message, "err"); }
+}
+async function step(which) {
+  const cid = document.getElementById("cid").value.trim();
+  const did = document.getElementById("did").value.trim();
+  try {
+    const j = await api(`/api/ceremonies/${cid}/${which}`, "POST", {device_id: did});
+    toast(which + " → " + (j.stage || j.status || "ok"), "ok");
+    refreshViews();
+  } catch (e) { toast(e.message, "err"); }
+}
+async function commitStep() {
+  const cid = document.getElementById("cid").value.trim();
+  try {
+    const j = await api(`/api/ceremonies/${cid}/commit`, "POST", {});
+    const kind = document.getElementById("ckind").value;
+    toast("committed" + (j.result ? ": " + JSON.stringify(j.result).slice(0,120) : ""), "ok");
+    refreshViews();
+  } catch (e) {
+    if (e.error === "PROTECTED_OPERATION") {
+      document.getElementById("tOp").value = "PURGE_RETIRED";
+      fillTicketHint();
+      document.getElementById("tPayload").value = JSON.stringify({ceremony_id: cid});
+      toast("DESTROY purge needs a PURGE_RETIRED ticket — payload prefilled", "err");
+    } else toast(e.message, "err");
+  }
+}
+async function doSign() {
+  try {
+    const j = await api("/api/sign", "POST", {
+      purpose: document.getElementById("spurpose").value,
+      message: document.getElementById("msg").value});
+    LAST_SIG = j;
+    const out = document.getElementById("sigout");
+    out.hidden = false;
+    out.textContent = `signed by ${j.version_id} (v${j.version}, ${j.status})\n${j.sig}`;
+  } catch (e) { toast(e.message, "err"); }
+}
+async function doVerify() {
+  if (!LAST_SIG) return toast("sign first", "err");
+  try {
+    const j = await api("/api/verify", "POST", {
+      purpose: document.getElementById("spurpose").value,
+      message: document.getElementById("msg").value, sig: LAST_SIG.sig});
+    toast(j.valid ? `valid: ${j.version_id} (${j.status}${j.active?", current":"":", historical"})`
+                  : "invalid", j.valid ? "ok" : "err");
+  } catch (e) { toast(e.message, "err"); }
+}
+async function enroll() {
+  try {
+    await api("/api/participants", "POST", {
+      participant_id: document.getElementById("ppid").value,
+      name: document.getElementById("pname").value,
+      role: document.getElementById("prole").value});
+    toast("enrolled + terminal provisioned", "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+async function revokeDevice() {
+  const did = document.getElementById("revDid").value.trim();
+  if (!did) return;
+  try {
+    const j = await api("/api/devices/revoke", "POST", {device_id: did});
+    toast(`revoked ${did}: sessions ${j.sessions_invalidated.length}, tickets ${j.tickets_closed.length}`, "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+// ---------------- audit / export ----------------
+async function loadAudit() {
+  try {
+    const j = await api("/api/audit");
+    document.getElementById("audit").textContent =
+      (j.verified ? "AUDIT CHAIN VERIFIED ✓\n\n" : "PROBLEMS: " + JSON.stringify(j.verify_problems) + "\n\n")
+      + j.entries.map(e => `${String(e.seq).padStart(4)} ${e.ts} ${e.event.padEnd(28)} ${JSON.stringify(e.payload).slice(0,220)}`).join("\n");
+  } catch (e) { toast(e.message, "err"); }
+}
+async function doExport() {
+  try {
+    const j = await api("/api/export");
+    const view = {
+      format: j.format, generated_at: j.generated_at,
+      service_identity_pub: j.service_identity_pub, service_sig: j.service_sig,
+      invariants: j.invariants,
+      auth_tickets: j.auth_tickets, sessions: j.sessions,
+      n_audit: j.audit.length, n_keys: j.keys.length,
+      n_ceremonies: j.ceremonies.length};
+    document.getElementById("audit").textContent =
+      "SIGNED EXPORT BUNDLE — four-eyes records (parties, token ids, digests, "
+      + "decision chains, execution)\n\n" + JSON.stringify(view, null, 2).slice(0, 16000);
+  } catch (e) { toast(e.message, "err"); }
+}
+
+// ---------------- cross-region DR drills ----------------
+async function loadDrills() {
+  try {
+    const [p, d] = await Promise.all([
+      api("/api/drill-plans"), api("/api/drills")]);
+    const rowsP = p.plans.slice().reverse().map(x =>
+      `<tr><td><small><a href="#" onclick="document.getElementById('drPlanId').value='${x.id}';document.getElementById('drRev').value=${x.revision};return false">${x.id}</a></small></td>
+       <td>${x.revision}</td><td>${pill(x.status)}</td>
+       <td>${x.fields.source_region} → ${x.fields.target_region}</td>
+       <td>${x.fields.recovery_point}</td><td><small>${x.fields.allowed_categories.join(",")}</small></td>
+       <td>${x.drill_id||"—"}</td></tr>`).join("");
+    const rowsD = d.drills.slice().reverse().map(x =>
+      `<tr><td><small><a href="#" onclick="document.getElementById('drillId').value='${x.id}';return false">${x.id}</a></small></td>
+       <td>${pill(x.status)}</td><td><small>${x.namespace}</small></td>
+       <td>${x.checkpoints.map(c=>c.stage).join("→")||"—"}</td>
+       <td>${x.mirror_stats.mirrored||0} mir / ${x.mirror_stats.matched||0} ok / ${x.mirror_stats.differences||0} diff</td>
+       <td>${x.lease?x.lease.status+" ("+x.lease.holder_instance+")":"—"}</td>
+       <td>${x.evidence_id?"ev ✓":"—"}</td></tr>`).join("");
+    document.getElementById("drillsView").innerHTML =
+      `<table><tr><th>plan</th><th>rev</th><th>status</th><th>regions</th>
+        <th>recovery point</th><th>categories</th><th>drill</th></tr>${rowsP}</table>
+       <table style="margin-top:8px"><tr><th>drill</th><th>status</th>
+        <th>namespace</th><th>checkpoints</th><th>mirror</th><th>lease</th>
+        <th>evidence</th></tr>${rowsD}</table>`;
+  } catch (e) { /* duty may not read drills */ }
+}
+function drShow(obj) {
+  const el = document.getElementById("drillOut");
+  el.hidden = false; el.textContent = JSON.stringify(obj, null, 2).slice(0, 8000);
+  loadDrills();
+}
+async function drDefineRegion() {
+  try {
+    await api("/api/drill-regions/define", "POST", {
+      name: document.getElementById("drRegion").value.trim(),
+      isolated: document.getElementById("drIsolated").checked,
+      capacity: parseInt(document.getElementById("drCapacity").value || "1073741824"),
+      isolation: document.getElementById("drIsolated").checked
+        ? "AIRGAPPED" : "AIRGAPPED"});
+    toast("region defined", "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+async function drRecoveryPoint() {
+  try {
+    const keys = document.getElementById("drObjKeys").value.split(",")
+      .map(s => s.trim()).filter(Boolean);
+    const j = await api("/api/drill-regions/recovery-point", "POST", {
+      region: document.getElementById("drRegion").value.trim(),
+      recovery_point: document.getElementById("drRp").value.trim(),
+      object_keys: keys});
+    toast("recovery point " + j.recovery_point + " (" + j.n_objects + " objs)", "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+function _planBody() {
+  return {
+    label: document.getElementById("drLabel").value,
+    source_region: document.getElementById("drSrc").value.trim(),
+    target_region: document.getElementById("drTgt").value.trim(),
+    recovery_point: document.getElementById("drRp").value.trim(),
+    allowed_categories: document.getElementById("drCats").value.split(",")
+      .map(s=>s.trim()).filter(Boolean),
+    rto_seconds: parseInt(document.getElementById("drRto").value),
+    rpo_seconds: parseInt(document.getElementById("drRpo").value),
+    mirror_ratio: parseFloat(document.getElementById("drRatio").value)};
+}
+async function drSavePlan() {
+  try {
+    const pid = document.getElementById("drPlanId").value.trim();
+    const body = pid
+      ? {plan_id: pid, base_revision: parseInt(
+          document.getElementById("drRev").value), ..._planBody()}
+      : _planBody();
+    const j = await api("/api/drill-plans", "POST", body);
+    document.getElementById("drPlanId").value = j.id;
+    document.getElementById("drRev").value = j.revision;
+    toast("plan " + j.id + " @ rev " + j.revision, "ok");
+    loadDrills();
+  } catch (e) {
+    if (e.error === "REVISION_CONFLICT") {
+      toast(`revision conflict: base r${e.base_revision} behind current r${e.current_revision}`, "err");
+      drShow({conflict: e, hint:"merge against current_snapshot then resubmit with base_revision="+e.current_revision});
+    } else toast(e.message, "err");
+  }
+}
+async function drScan() {
+  try {
+    const pid = document.getElementById("drPlanId").value.trim();
+    const j = await api(`/api/drill-plans/${pid}/scan`, "POST", {});
+    toast("scan passed; blueprint fixed (rev " + j.revision + ")", "ok");
+    drShow(j.scans);
+  } catch (e) {
+    drShow(e.problems || e); toast(e.message, "err");
+  }
+}
+async function drStart() {
+  try {
+    const pid = document.getElementById("drPlanId").value.trim();
+    const j = await api(`/api/drill-plans/${pid}/start`, "POST", {});
+    document.getElementById("drillId").value = j.id;
+    toast("drill " + j.id + " started; short-lived credential issued once", "ok");
+    drShow({credential: j.credential, namespace: j.namespace});
+  } catch (e) { toast(e.message, "err"); }
+}
+async function drStage() {
+  try { drShow(await api(`/api/drills/${did()}/run-to-ready`, "POST", {})); }
+  catch (e) { toast(e.message, "err"); }
+}
+function did() { return document.getElementById("drillId").value.trim(); }
+async function drWindow(open) {
+  try {
+    const body = open ? {seconds: 900} : {close: true};
+    drShow(await api(`/api/drills/${did()}/window`, "POST", body));
+  } catch (e) { toast(e.message, "err"); }
+}
+async function drMirror() {
+  try {
+    let req = {};
+    try { req = JSON.parse(document.getElementById("drReq").value); }
+    catch(_) { return toast("request JSON invalid", "err"); }
+    drShow(await api(`/api/drills/${did()}/mirror`, "POST", req));
+  } catch (e) {
+    if (e.error === "DRILL_FROZEN") toast("drill FROZEN — repair then resume", "err");
+    else if (e.error === "POLICY_VIOLATION")
+      toast("write refused: writes always stay in production", "err");
+    else toast(e.message, "err");
+  }
+}
+async function drResume() {
+  try { drShow(await api(`/api/drills/${did()}/resume`, "POST",
+                        {note: "repaired from console"})); }
+  catch (e) { toast(e.message, "err"); }
+}
+async function drLease() {
+  try {
+    drShow(await api(`/api/drills/${did()}/lease`, "POST",
+      {instance_id: document.getElementById("drInstance").value,
+       ttl_seconds: 300}));
+  } catch (e) { toast(e.error + ": " + e.message, "err"); }
+}
+async function drFailback() {
+  try { drShow(await api(`/api/drills/${did()}/failback`, "POST", {})); }
+  catch (e) { toast(e.message, "err"); }
+}
+async function drArchiveDiffs() {
+  try { drShow(await api(`/api/drills/${did()}/archive-differences`, "POST", {})); }
+  catch (e) { toast(e.message, "err"); }
+}
+async function drTerminate() {
+  try {
+    const j = await api(`/api/drills/${did()}/terminate`, "POST", {});
+    drShow(j); toast("status: " + j.status, j.status === "CLEANED" ? "ok" : "err");
+  } catch (e) {
+    if (e.error === "CLEANUP_BLOCKED") { toast("cleanup blocked", "err"); drShow(e.blockers); }
+    else toast(e.message, "err");
+  }
+}
+
+// ---------------- boot ----------------
+async function boot(announce) {
+  if (!localStorage.getItem("kc_token")) { applySession(null); return; }
+  try {
+    const me = await api("/api/session/me");
+    applySession(me);
+    fillTicketHint();
+    await Promise.all([refreshViews(), loadTickets(), loadDrills()]);
+    if (announce) toast("session restored", "ok");
+  } catch (e) {
+    if (e.status === 401) {
+      localStorage.removeItem("kc_token");
+      applySession(null);
+      toast("session expired/invalid — please log in again", "err");
+    } else {
+      toast(e.message, "err");
+    }
+  }
+}
+fillTicketHint();
+boot(false);
+setInterval(() => { if (ME && Date.now()/1000 > ME.expires_at - 5) boot(false); }, 15000);
+</script>
+</body>
+</html>
