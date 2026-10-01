@@ -13,7 +13,11 @@ Lifecycle
       -> scanned: fixed recovery blueprint (+ short-lived creds/namespace)
       -> PREPARE -> COPY -> REBUILD_INDEX -> SHADOW_START -> PROBES -> READY
       -> observation window: read-only mirror traffic, comparator
-      -> (differences: FROZEN -> resume after repair, or terminate)
+      with a non-negative-integer mismatch tolerance quota (the bypass is
+      deactivated only once the atomically accumulated mismatch count grows
+      greater than the quota; the tally survives concurrency, restarts and
+      manual resumes and a replayed correlation id is never counted twice)
+      -> (quota crossed: FROZEN -> resume after repair, or terminate)
       -> leased failover (read-only verification ingress only)
       -> failback (converged state machine; idempotent)
       -> cleanup (resumable; blocked while traffic/lease/unarchived diffs)
@@ -97,6 +101,7 @@ READ_ONLY_OPERATIONS = frozenset({"VERIFY", "GET_KEY", "LIST_KEYS", "READ"})
 DEFAULT_CRED_TTL = 3600
 DEFAULT_WINDOW_SECONDS = 900
 DEFAULT_LEASE_SECONDS = 300
+DEFAULT_DIFF_THRESHOLD = 1
 
 PLAN_FIELDS = (
     "label", "source_region", "target_region", "recovery_point",
@@ -107,6 +112,22 @@ PLAN_FIELDS = (
 
 def _mid(prefix: str) -> str:
     return f"{prefix}_{os.urandom(10).hex()}"
+
+
+def _nonneg_int(f: dict, key: str, default: int) -> int:
+    """Coerce a plan field to a non-negative integer.
+
+    Booleans, floats (1.5 would silently truncate under plain int()) and
+    negative values are rejected up front with a policy error.
+    """
+    if key not in f or f[key] is None:
+        return default
+    v = f[key]
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise PolicyViolation(f"{key} must be a non-negative integer")
+    if v < 0:
+        raise PolicyViolation(f"{key} must be a non-negative integer")
+    return v
 
 
 def _now(clock) -> float:
@@ -224,7 +245,8 @@ class DrillsManager:
             "rto_seconds": int(f["rto_seconds"]),
             "rpo_seconds": int(f["rpo_seconds"]),
             "mirror_ratio": float(f.get("mirror_ratio", 0.1)),
-            "diff_threshold": int(f.get("diff_threshold", 1)),
+            "diff_threshold": _nonneg_int(
+                f, "diff_threshold", DEFAULT_DIFF_THRESHOLD),
             "latency_threshold_ms": int(f.get("latency_threshold_ms", 500)),
         }
 
@@ -264,6 +286,10 @@ class DrillsManager:
         ratio = float(f.get("mirror_ratio", 0.1))
         if not 0.0 < ratio <= 1.0:
             raise PolicyViolation("mirror_ratio must be within (0, 1]")
+        # The comparison tolerance quota is a *count* of tolerated
+        # inconsistencies: non-negative integer only (0 deactivates the bypass
+        # on the first mismatch, 1 allows one, ...).
+        _nonneg_int(f, "diff_threshold", DEFAULT_DIFF_THRESHOLD)
 
     def plan_fields(self, plan_id: str) -> dict:
         return self._plan(plan_id)["revisions"][-1]["fields"]
@@ -599,6 +625,15 @@ class DrillsManager:
             "mirror": {"requests": [], "differences": [], "stats": {
                 "mirrored": 0, "matched": 0, "differences": 0,
                 "timeouts": 0, "production_only": 0}},
+            # Observation-comparator tolerance bookkeeping. The quota
+            # (diff_threshold) is pinned when the drill starts; the mismatch
+            # counter accumulates atomically under the store lock and survives
+            # restarts and manual resumes. The bypass is deactivated only once
+            # mismatch_count grows *greater than* the quota.
+            "tolerance": {"quota": fields["diff_threshold"],
+                          "mismatch_count": 0,
+                          "trigger_request_id": None,
+                          "history": []},
             "lease": None,
             "failback": None,
             "freeze": None,
@@ -1018,11 +1053,6 @@ class DrillsManager:
         op = request.get("operation", "READ")
         rid = request.get("request_id") or _mid("req")
         forced = bool(request.get("mirror_to_shadow"))
-        # A frozen drill refuses further shadow traffic until repaired.
-        if d["status"] == DRILL_FROZEN:
-            raise DrillFrozen(
-                "drill is frozen after a threshold breach; resume after "
-                "repair or terminate")
         record = {
             "request_id": rid, "operation": op,
             "client_forced_mirror": forced,
@@ -1031,6 +1061,11 @@ class DrillsManager:
         }
         # 1. write operations: production only, forged flag rejected
         if op in WRITE_OPERATIONS:
+            # A frozen drill refuses further traffic before executing anything.
+            if d["status"] == DRILL_FROZEN:
+                raise DrillFrozen(
+                    "drill is frozen after a threshold breach; resume after "
+                    "repair or terminate")
             record["routed_to"] = "production"
             record["reason"] = (
                 "write operations must stay in the production region"
@@ -1047,6 +1082,22 @@ class DrillsManager:
 
         if op not in READ_ONLY_OPERATIONS:
             raise PolicyViolation(f"unknown request operation {op}")
+
+        # Idempotency precedes the frozen guard: re-submitting the correlation
+        # id of a comparison already made (including the one that deactivated
+        # the bypass) returns the recorded verdict. The shadow is not re-queried
+        # and the mismatch counter is not touched - so a client retry after a
+        # crash can never count twice, even while FROZEN.
+        prior = self._prior_mirrored(d, rid)
+        if prior is not None:
+            return self._mirror_replay(
+                d, prior, self._production_read(d, request)["value"])
+
+        # A frozen drill refuses further *new* shadow traffic until repaired.
+        if d["status"] == DRILL_FROZEN:
+            raise DrillFrozen(
+                "drill is frozen after a threshold breach; resume after "
+                "repair or terminate")
 
         # 2. read-only: production always answers; mirror at ratio while an
         # observation window is open.
@@ -1071,7 +1122,8 @@ class DrillsManager:
         if not selected:
             d["mirror"]["requests"].append(record)
             return {"request_id": rid, "served_by": "production",
-                    "mirrored": False, "result": prod_result["value"]}
+                    "mirrored": False, "result": prod_result["value"],
+                    "tolerance": self._tolerance_view(d)}
 
         # 3. mirror to shadow + compare
         shadow = self._shadow_read(d, request,
@@ -1102,18 +1154,87 @@ class DrillsManager:
         }
         if diffs:
             d["mirror"]["stats"]["differences"] += 1
-            d["mirror"]["differences"].append(cmp_rec)
             record["differences"] = diffs
+            # Comparison record + request log + counter increment +
+            # deactivation decision are one atomic step under the store lock,
+            # so concurrent verifications observe a single total order.
+            tol = self._tolerance(d)
+            tol["mismatch_count"] += 1
+            cmp_rec["mismatch_count"] = tol["mismatch_count"]
+            cmp_rec["quota"] = tol["quota"]
+            d["mirror"]["differences"].append(cmp_rec)
             d["mirror"]["requests"].append(record)
-            self._freeze(d, reason=diffs[0], request_id=rid)
-            return {"request_id": rid, "served_by": "production",
+            # The bypass is deactivated only when the *accumulated* count
+            # grows greater than the quota (quota 0: first mismatch).
+            if tol["mismatch_count"] > tol["quota"]:
+                self._freeze(d, reason=diffs[0], request_id=rid)
+                return {"request_id": rid, "served_by": "production",
+                        "mirrored": True, "differences": diffs,
+                        "frozen": True, "result": prod_result["value"],
+                        "tolerance": self._tolerance_view(d)}
+            self.audit.append(
+                "drill_mirror_mismatch_tolerated",
+                {"drill_id": d["id"], "request_id": rid,
+                 "differences": diffs,
+                 "mismatch_count": tol["mismatch_count"],
+                 "quota": tol["quota"]})
+            return {"request_id": rid, "served_by": "production+shadow",
                     "mirrored": True, "differences": diffs,
-                    "frozen": True, "result": prod_result["value"]}
+                    "frozen": False, "tolerated": True,
+                    "result": prod_result["value"],
+                    "tolerance": self._tolerance_view(d)}
         d["mirror"]["stats"]["matched"] += 1
         d["mirror"]["requests"].append(record)
         return {"request_id": rid, "served_by": "production+shadow",
                 "mirrored": True, "matched": True,
-                "result": prod_result["value"]}
+                "result": prod_result["value"],
+                "tolerance": self._tolerance_view(d)}
+
+    # ---- comparison tolerance quota ---------------------------------------
+    def _tolerance(self, d: dict) -> dict:
+        """Persistent tolerance state; also fills records started by an
+        older build so the counter semantics survive an in-place upgrade."""
+        tol = d.get("tolerance")
+        if tol is None:
+            tol = {"quota": int(d["fields"].get("diff_threshold",
+                                                DEFAULT_DIFF_THRESHOLD)),
+                   "mismatch_count": 0,
+                   "trigger_request_id": None,
+                   "history": []}
+            d["tolerance"] = tol
+        return tol
+
+    def _tolerance_view(self, d: dict) -> dict:
+        """Same quota / count / deactivation-correlation-id triple surfaced
+        by the HTTP responses, the drill page and the evidence archive."""
+        tol = self._tolerance(d)
+        return {"quota": tol["quota"],
+                "mismatch_count": tol["mismatch_count"],
+                "deactivated": d["status"] == DRILL_FROZEN,
+                "trigger_request_id": tol["trigger_request_id"]}
+
+    def _prior_mirrored(self, d: dict, request_id: str) -> dict | None:
+        return next((r for r in d["mirror"]["requests"]
+                     if r["request_id"] == request_id and r["mirrored"]),
+                    None)
+
+    def _mirror_replay(self, d: dict, prior: dict, value) -> dict:
+        """Idempotent response for a correlation id already compared: the
+        shadow is not re-queried and the mismatch counter is not touched."""
+        diffs = prior.get("differences") or []
+        tol = self._tolerance(d)
+        out = {
+            "request_id": prior["request_id"],
+            "served_by": ("production+shadow" if not diffs else "production"),
+            "mirrored": True, "replayed": True, "result": value,
+            "tolerance": self._tolerance_view(d),
+        }
+        if diffs:
+            out["differences"] = diffs
+            out["frozen"] = tol["trigger_request_id"] == prior["request_id"]
+        else:
+            out["matched"] = True
+        return out
 
     @staticmethod
     def _select_for_mirror(request_id: str, ratio: float) -> bool:
@@ -1143,13 +1264,26 @@ class DrillsManager:
 
     # ---- freeze / resume --------------------------------------------------
     def _freeze(self, d: dict, *, reason: str, request_id: str):
+        tol = self._tolerance(d)
+        # The correlation id of the comparison that crossed the quota is the
+        # one the page, HTTP responses and the evidence package all cite.
+        tol["trigger_request_id"] = request_id
+        tol["history"].append(
+            {"request_id": request_id, "reason": reason,
+             "at": _now(self.clock),
+             "mismatch_count": tol["mismatch_count"],
+             "quota": tol["quota"]})
         d["status"] = DRILL_FROZEN
         d["freeze"] = {"reason": reason, "request_id": request_id,
                        "at": _now(self.clock),
-                       "checkpoints": len(d["checkpoints"])}
+                       "checkpoints": len(d["checkpoints"]),
+                       "quota": tol["quota"],
+                       "mismatch_count": tol["mismatch_count"]}
         self.audit.append("drill_frozen",
                           {"drill_id": d["id"], "reason": reason,
-                           "request_id": request_id})
+                           "request_id": request_id,
+                           "quota": tol["quota"],
+                           "mismatch_count": tol["mismatch_count"]})
 
     def resume_after_repair(self, drill_id: str, actor: str,
                             *, note: str = "") -> dict:
@@ -1169,14 +1303,22 @@ class DrillsManager:
         fz["resumed_by"] = actor
         fz["repair_note"] = note
         d["status"] = DRILL_READY
+        # Manual release reactivates the bypass but does not reset the tally:
+        # the accumulated mismatch count stays continuous (it also survives
+        # service restarts, as it lives in the persisted drill record).
+        tol = self._tolerance(d)
+        tol["trigger_request_id"] = None
         self.audit.append("drill_resumed",
                           {"drill_id": drill_id, "actor": actor, "note": note,
-                           "frozen_at": fz["at"]})
+                           "frozen_at": fz["at"],
+                           "mismatch_count": tol["mismatch_count"],
+                           "quota": tol["quota"]})
         return self.public_drill(drill_id)
 
     def mirror_stats(self, drill_id: str) -> dict:
         d = self._drill(drill_id)
-        return dict(d["mirror"]["stats"])
+        return {"stats": dict(d["mirror"]["stats"]),
+                "tolerance": self._tolerance_view(d)}
 
     # ======================================================================
     # failover lease
@@ -1488,6 +1630,7 @@ class DrillsManager:
                 "closed": d["window"]["closed"],
                 "ratio": d["window"]["ratio"]}),
             "mirror_stats": dict(d["mirror"]["stats"]),
+            "tolerance": self._tolerance_view(d),
             "differences": list(d["mirror"]["differences"]),
             "freeze": d.get("freeze"),
             "lease": d.get("lease"),

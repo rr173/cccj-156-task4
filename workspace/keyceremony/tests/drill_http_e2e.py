@@ -101,7 +101,8 @@ try:
         "target_region": "eu-west-airgap", "recovery_point": "rp-1",
         "allowed_categories": ["key_material", "public_keys", "audit",
                                "index", "policy"],
-        "rto_seconds": 300, "rpo_seconds": 3600, "mirror_ratio": 1.0}
+        "rto_seconds": 300, "rpo_seconds": 3600, "mirror_ratio": 1.0,
+        "diff_threshold": 0}
 
     # ---- 2. revision conflict --------------------------------------------
     s, plan = call("/api/drill-plans", plan_body, TOKENS["alice"])
@@ -164,12 +165,35 @@ try:
                  {"operation": "VERIFY", "key": "k", "request_id": "diff-1",
                   "_shadow_value_override": {"bad": True}}, TOKENS["diego"])
     assert s == 200 and fr["frozen"], (s, fr)
+    # quota 0: the first mismatch is the deactivation trigger; the response
+    # and the drill view carry the identical quota/count/correlation triple.
+    assert fr["tolerance"] == {"quota": 0, "mismatch_count": 1,
+                               "deactivated": True,
+                               "trigger_request_id": "diff-1"}, fr["tolerance"]
     s, gd = call(f"/api/drills/{did}", token=TOKENS["alice"])
     assert gd["status"] == "FROZEN"
+    assert gd["tolerance"] == fr["tolerance"], (gd["tolerance"], fr["tolerance"])
+    assert gd["freeze"]["request_id"] == "diff-1"
+    s, ms = call(f"/api/drills/{did}/mirror-stats", token=TOKENS["alice"])
+    assert s == 200 and ms["tolerance"] == fr["tolerance"], ms
     s, _ = call(f"/api/drills/{did}/resume", {"note": "shadow repaired"},
                 TOKENS["diego"])
     assert s == 200
-    print("difference freeze + resume ok")
+    # manual release keeps the tally continuous but clears the live trigger
+    s, gd2 = call(f"/api/drills/{did}", token=TOKENS["alice"])
+    assert gd2["tolerance"]["mismatch_count"] == 1
+    assert gd2["tolerance"]["quota"] == 0
+    assert gd2["tolerance"]["trigger_request_id"] is None
+    # a retried correlation id never increments the counter twice
+    s, rpl = call(f"/api/drills/{did}/window", {"seconds": 600}, TOKENS["diego"])
+    assert s == 200
+    s, rpl = call(f"/api/drills/{did}/mirror",
+                  {"operation": "VERIFY", "key": "k", "request_id": "diff-1",
+                   "_shadow_value_override": {"bad": True}}, TOKENS["diego"])
+    assert s == 200 and rpl.get("replayed"), rpl
+    assert rpl["tolerance"]["mismatch_count"] == 1, rpl["tolerance"]
+    call(f"/api/drills/{did}/window", {"close": True}, TOKENS["diego"])
+    print("difference freeze + resume + tolerance triple ok")
 
     # ---- 6. lease: close window, single holder under contention ---------
     s, _ = call(f"/api/drills/{did}/window", {"close": True},
@@ -222,6 +246,13 @@ try:
     assert verdict["ok"], verdict["problems"]
     assert verdict["checks"]["drill_evidence_ok"], verdict["checks"]
     assert bundle["invariants"]["n_drills"] >= 1
+    # the evidence archive carries the same quota/count and the triggering
+    # correlation id (diff-1 and diff-2 both crossed quota 0)
+    ev = next(e for e in bundle["drill_evidence"] if e["drill_id"] == did)
+    et = ev["mirror"]["tolerance"]
+    assert et["quota"] == 0, et
+    assert et["mismatch_count"] == len(ev["mirror"]["differences"]) == 2, et
+    assert [h["request_id"] for h in et["history"]] == ["diff-1", "diff-2"], et
     print("export bundle with drill evidence verified:",
           verdict["checks"]["drill_evidence_ok"])
 

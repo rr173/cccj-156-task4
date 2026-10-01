@@ -8,7 +8,8 @@ material or credential secrets:
   * blueprint summary (pinned config sequences, categories, RTO/RPO),
   * ordered stage checkpoints with idempotency keys,
   * probe input/output summaries,
-  * mirror comparison statistics,
+  * mirror comparison statistics and the comparator tolerance quota /
+    accumulated mismatch count / deactivation trigger correlation id,
   * lease history,
   * failback and cleanup results.
 
@@ -20,6 +21,7 @@ constituent section carries a recomputable digest. An independent checker
   * skipped probes / missing stages,
   * duplicate stages or repeated idempotency keys,
   * mirror requests outside an observation window,
+  * tolerance quota/count/trigger correlation id inconsistencies,
   * overlapping or multiply-held leases,
   * evidence gaps (a section the lifecycle required is missing).
 
@@ -87,8 +89,20 @@ def build_evidence(d: dict, service_seed: bytes, clock=time.time) -> dict:
         for p in d["probes"]
     ]
     stats = dict(d["mirror"]["stats"])
+    tol = d.get("tolerance")
+    tolerance = None
+    if tol is not None:
+        # The same quota / current count / deactivation correlation id shown
+        # by the page and the HTTP responses, frozen into the archive.
+        tolerance = {
+            "quota": tol["quota"],
+            "mismatch_count": tol["mismatch_count"],
+            "trigger_request_id": tol.get("trigger_request_id"),
+            "history": [dict(h) for h in tol.get("history", [])],
+        }
     mirror = {
         "stats": stats,
+        "tolerance": tolerance,
         "window": d.get("window"),
         "requests": [
             {"request_id": r["request_id"], "operation": r["operation"],
@@ -194,6 +208,21 @@ def normalize(ev: dict) -> dict:
         lease["history"] = [
             {"at": lease.get("acquired_at"), "event": "acquired",
              "instance": lease.get("holder_instance")}]
+    # v1 archives froze the comparator on the first difference (implicit
+    # quota 0); synthesize the tolerance view so the lifecycle checks apply
+    # without changing the signed content (normalize works on a copy).
+    mirror = out.get("mirror")
+    if isinstance(mirror, dict) and mirror.get("tolerance") is None:
+        diffs = mirror.get("differences") or []
+        trigger = diffs[-1]["request_id"] if diffs else None
+        mirror["tolerance"] = {
+            "quota": 0,
+            "mismatch_count": len(diffs),
+            "trigger_request_id": trigger,
+            "history": [{"request_id": trigger, "reason": "legacy_freeze",
+                         "mismatch_count": len(diffs), "quota": 0}]
+            if trigger is not None else [],
+        }
     return out
 
 
@@ -340,6 +369,60 @@ def verify_evidence(ev: dict, *, expect_final_status: str | None = None,
             problems.append(
                 "mirror stats inconsistent: matched+differences exceed "
                 "mirrored total")
+
+    # 5b. comparison tolerance: quota/count/trigger correlation id must be
+    # internally consistent with the recorded differences.
+    tol = mirror.get("tolerance")
+    if tol is not None:
+        quota = tol.get("quota")
+        count = tol.get("mismatch_count")
+        diffs = mirror.get("differences", [])
+        if not isinstance(quota, int) or isinstance(quota, bool) or quota < 0:
+            problems.append("comparison tolerance quota is not a non-negative "
+                            "integer")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            problems.append("comparison mismatch count is not a non-negative "
+                            "integer")
+        else:
+            if count != len(diffs):
+                problems.append(
+                    f"comparison mismatch count {count} does not match the "
+                    f"{len(diffs)} recorded difference(s)")
+            if count > len(mirror.get("requests", [])):
+                problems.append(
+                    "comparison mismatch count exceeds mirrored request count")
+            trigger = tol.get("trigger_request_id")
+            if trigger is not None:
+                # deactivation requires a recorded comparison carrying that
+                # correlation id and an accumulated count over the quota
+                tr = next((x for x in diffs
+                           if x.get("request_id") == trigger), None)
+                if tr is None:
+                    problems.append(
+                        f"tolerance trigger correlation id {trigger} has no "
+                        "recorded comparison difference")
+                elif isinstance(quota, int) and count <= quota:
+                    problems.append(
+                        f"bypass deactivated by {trigger} with mismatch count "
+                        f"{count} <= quota {quota}")
+            elif isinstance(quota, int) and count > quota:
+                # An accumulated count over the quota means the bypass was
+                # deactivated at least once. If the drill is still frozen the
+                # live trigger correlation id must be present; a later manual
+                # resume (drill continued to cleanup) clears it - the
+                # deactivation is then retained in history.
+                hist = tol.get("history") or []
+                frozen_now = ev.get("final_status") == "FROZEN"
+                if trigger is not None:
+                    pass
+                elif frozen_now:
+                    problems.append(
+                        f"mismatch count {count} exceeds quota {quota} but no "
+                        "deactivation trigger correlation id is recorded")
+                elif not any(h.get("request_id") for h in hist):
+                    problems.append(
+                        f"mismatch count {count} exceeds quota {quota} but no "
+                        "deactivation trigger or release history is recorded")
 
     # 6. lease history: at most one held interval, no overlap
     lease = ev.get("lease")

@@ -226,6 +226,8 @@
       <input id="drRpo" placeholder="rpo_s" value="3600" style="width:90px"/>
       <input id="drRatio" placeholder="mirror_ratio" value="0.1"
              style="width:100px"/>
+      <input id="drQuota" placeholder="diff quota (≥0 int)" value="0"
+             type="number" min="0" step="1" style="width:150px"/>
       <input id="drCats" placeholder="categories" style="flex:1"
              value="key_material,public_keys,audit,index,policy"/>
     </div>
@@ -582,19 +584,25 @@ async function loadDrills() {
        <td>${x.fields.source_region} → ${x.fields.target_region}</td>
        <td>${x.fields.recovery_point}</td><td><small>${x.fields.allowed_categories.join(",")}</small></td>
        <td>${x.drill_id||"—"}</td></tr>`).join("");
-    const rowsD = d.drills.slice().reverse().map(x =>
-      `<tr><td><small><a href="#" onclick="document.getElementById('drillId').value='${x.id}';return false">${x.id}</a></small></td>
+    const rowsD = d.drills.slice().reverse().map(x => {
+      const t = x.tolerance || {quota:0, mismatch_count:0, trigger_request_id:null};
+      const trig = x.freeze
+        ? `${x.freeze.reason} @ <small>${t.trigger_request_id||x.freeze.request_id||"—"}</small>`
+        : "active";
+      return `<tr><td><small><a href="#" onclick="document.getElementById('drillId').value='${x.id}';return false">${x.id}</a></small></td>
        <td>${pill(x.status)}</td><td><small>${x.namespace}</small></td>
        <td>${x.checkpoints.map(c=>c.stage).join("→")||"—"}</td>
        <td>${x.mirror_stats.mirrored||0} mir / ${x.mirror_stats.matched||0} ok / ${x.mirror_stats.differences||0} diff</td>
+       <td title="comparison tolerance quota">quota <b>${t.quota}</b> · mism <b>${t.mismatch_count}</b><br><small>bypass: ${trig}</small></td>
        <td>${x.lease?x.lease.status+" ("+x.lease.holder_instance+")":"—"}</td>
-       <td>${x.evidence_id?"ev ✓":"—"}</td></tr>`).join("");
+       <td>${x.evidence_id?"ev ✓":"—"}</td></tr>`;}).join("");
     document.getElementById("drillsView").innerHTML =
       `<table><tr><th>plan</th><th>rev</th><th>status</th><th>regions</th>
         <th>recovery point</th><th>categories</th><th>drill</th></tr>${rowsP}</table>
        <table style="margin-top:8px"><tr><th>drill</th><th>status</th>
-        <th>namespace</th><th>checkpoints</th><th>mirror</th><th>lease</th>
-        <th>evidence</th></tr>${rowsD}</table>`;
+        <th>namespace</th><th>checkpoints</th><th>mirror</th>
+        <th>tolerance (quota / mismatches · trigger)</th>
+        <th>lease</th><th>evidence</th></tr>${rowsD}</table>`;
   } catch (e) { /* duty may not read drills */ }
 }
 function drShow(obj) {
@@ -625,6 +633,11 @@ async function drRecoveryPoint() {
   } catch (e) { toast(e.message, "err"); }
 }
 function _planBody() {
+  // quota must be a non-negative integer: reject blanks, fractions and signs
+  const qraw = document.getElementById("drQuota").value.trim();
+  if (!/^\d+$/.test(qraw)) {
+    throw new Error("diff quota must be a non-negative integer (0 or 1 allowed)");
+  }
   return {
     label: document.getElementById("drLabel").value,
     source_region: document.getElementById("drSrc").value.trim(),
@@ -634,19 +647,23 @@ function _planBody() {
       .map(s=>s.trim()).filter(Boolean),
     rto_seconds: parseInt(document.getElementById("drRto").value),
     rpo_seconds: parseInt(document.getElementById("drRpo").value),
-    mirror_ratio: parseFloat(document.getElementById("drRatio").value)};
+    mirror_ratio: parseFloat(document.getElementById("drRatio").value),
+    diff_threshold: parseInt(qraw, 10)};
 }
 async function drSavePlan() {
   try {
+    let body;
+    try { body = _planBody(); } catch (e) { return toast(e.message, "err"); }
     const pid = document.getElementById("drPlanId").value.trim();
-    const body = pid
+    body = pid
       ? {plan_id: pid, base_revision: parseInt(
-          document.getElementById("drRev").value), ..._planBody()}
-      : _planBody();
+          document.getElementById("drRev").value), ...body}
+      : body;
     const j = await api("/api/drill-plans", "POST", body);
     document.getElementById("drPlanId").value = j.id;
     document.getElementById("drRev").value = j.revision;
-    toast("plan " + j.id + " @ rev " + j.revision, "ok");
+    toast("plan " + j.id + " @ rev " + j.revision + " · quota "
+          + j.fields.diff_threshold, "ok");
     loadDrills();
   } catch (e) {
     if (e.error === "REVISION_CONFLICT") {

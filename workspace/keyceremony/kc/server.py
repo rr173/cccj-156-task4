@@ -205,7 +205,7 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) == 4 and parts[3] == "failover-status":
                     return ctx.drills.failover_status(parts[2])
                 if len(parts) == 4 and parts[3] == "mirror-stats":
-                    return {"stats": ctx.drills.mirror_stats(parts[2])}
+                    return ctx.drills.mirror_stats(parts[2])
             if path.startswith("/api/drill-plans/"):
                 parts = path.strip("/").split("/")
                 if len(parts) == 3:
@@ -533,6 +533,9 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _plan_fields(b: dict) -> dict:
+        # diff_threshold is passed through untouched: the manager validates
+        # that it is a non-negative integer (plain int() here would truncate
+        # 1.5 and accept negatives).
         return {
             "label": b["label"],
             "source_region": b["source_region"],
@@ -542,7 +545,7 @@ class Handler(BaseHTTPRequestHandler):
             "rto_seconds": int(b["rto_seconds"]),
             "rpo_seconds": int(b["rpo_seconds"]),
             "mirror_ratio": float(b.get("mirror_ratio", 0.1)),
-            "diff_threshold": int(b.get("diff_threshold", 1)),
+            "diff_threshold": b.get("diff_threshold", 1),
             "latency_threshold_ms": int(b.get("latency_threshold_ms", 500)),
         }
 

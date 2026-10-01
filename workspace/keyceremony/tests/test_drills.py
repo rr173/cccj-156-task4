@@ -557,6 +557,232 @@ class TestMirrorFreeze(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# scenario 6b: comparison tolerance quota (non-negative integer, atomic
+# accumulation, deactivate only when count > quota, continuous across
+# concurrency / restart / manual release, no duplicate counting, identical
+# figures on page view / HTTP-shaped response / evidence archive)
+# ---------------------------------------------------------------------------
+class TestToleranceQuota(unittest.TestCase):
+    def _world(self, root):
+        return DrillWorld(root, clock=Clock())
+
+    def _mismatch(self, dm, did, rid, bad=1):
+        return dm.mirror_request(
+            did, {"operation": "VERIFY", "key": "k", "request_id": rid,
+                  "_shadow_value_override": {"bad": bad}})
+
+    def test_quota_must_be_non_negative_integer(self):
+        w = self._world("/tmp/kc-tol-validate")
+        with w.store.locked():
+            for bad in (-1, -3, 1.5, 0.0, True, False, "3", 2.9):
+                with self.assertRaises(PolicyViolation):
+                    w.dm.create_plan(w.fields(diff_threshold=bad), "alice")
+            for good in (0, 1, 3, 10):
+                p = w.dm.create_plan(w.fields(diff_threshold=good), "alice")
+                self.assertEqual(p["fields"]["diff_threshold"], good)
+                self.assertIsInstance(p["fields"]["diff_threshold"], int)
+            # a revised plan is re-validated the same way
+            p = w.dm.create_plan(w.fields(diff_threshold=0), "alice")
+            with self.assertRaises(PolicyViolation):
+                w.dm.update_plan(p["id"], w.fields(diff_threshold=-2), "alice",
+                                 base_revision=1)
+            w.save()
+
+    def test_quota_three_needs_four_mismatches(self):
+        w = self._world("/tmp/kc-tol-three")
+        with w.store.locked():
+            did = w.ready_drill(diff_threshold=3)
+            w.dm.open_window(did, "alice", seconds=600)
+            for i, rid in enumerate(("a", "b", "c"), start=1):
+                r = self._mismatch(w.dm, did, rid, bad=i)
+                self.assertFalse(r["frozen"], rid)
+                self.assertTrue(r["tolerated"])
+                self.assertEqual(r["tolerance"]["quota"], 3)
+                self.assertEqual(r["tolerance"]["mismatch_count"], i)
+                self.assertIsNone(r["tolerance"]["trigger_request_id"])
+                self.assertNotEqual(
+                    w.dm.get_drill(did)["status"], DRILL_FROZEN)
+            r = self._mismatch(w.dm, did, "d", bad=9)
+            self.assertTrue(r["frozen"])
+            self.assertEqual(r["tolerance"]["mismatch_count"], 4)
+            self.assertEqual(r["tolerance"]["trigger_request_id"], "d")
+            view = w.dm.get_drill(did)
+            self.assertEqual(view["status"], DRILL_FROZEN)
+            self.assertEqual(view["freeze"]["request_id"], "d")
+            self.assertEqual(view["freeze"]["quota"], 3)
+            self.assertEqual(view["freeze"]["mismatch_count"], 4)
+            w.save()
+
+    def test_quota_zero_and_one(self):
+        for quota, trigger_no in ((0, 1), (1, 2)):
+            w = self._world(f"/tmp/kc-tol-q{quota}")
+            with w.store.locked():
+                did = w.ready_drill(diff_threshold=quota)
+                w.dm.open_window(did, "alice", seconds=600)
+                for i in range(quota):
+                    r = self._mismatch(w.dm, did, f"tol-{i}", bad=i)
+                    self.assertFalse(r["frozen"])
+                r = self._mismatch(w.dm, did, "trig", bad=42)
+                self.assertTrue(r["frozen"])
+                self.assertEqual(r["tolerance"]["mismatch_count"], trigger_no)
+                self.assertEqual(r["tolerance"]["trigger_request_id"], "trig")
+                w.save()
+
+    def test_count_continuous_after_manual_release(self):
+        w = self._world("/tmp/kc-tol-resume")
+        with w.store.locked():
+            did = w.ready_drill(diff_threshold=1)
+            w.dm.open_window(did, "alice", seconds=600)
+            self._mismatch(w.dm, did, "m1", bad=1)          # tolerated
+            self._mismatch(w.dm, did, "m2", bad=2)          # deactivates
+            self.assertEqual(
+                w.dm.get_drill(did)["tolerance"]["mismatch_count"], 2)
+            w.dm.resume_after_repair(did, "alice", note="fixed")
+            view = w.dm.get_drill(did)
+            # count and quota kept; live trigger correlation id cleared
+            self.assertEqual(view["tolerance"]["mismatch_count"], 2)
+            self.assertEqual(view["tolerance"]["quota"], 1)
+            self.assertIsNone(view["tolerance"]["trigger_request_id"])
+            w.dm.open_window(did, "alice", seconds=600)
+            # the tally continues: the next mismatch immediately re-freezes
+            r = self._mismatch(w.dm, did, "m3", bad=3)
+            self.assertTrue(r["frozen"])
+            self.assertEqual(r["tolerance"]["mismatch_count"], 3)
+            self.assertEqual(r["tolerance"]["trigger_request_id"], "m3")
+            w.save()
+
+    def test_replayed_correlation_id_not_counted_twice(self):
+        w = self._world("/tmp/kc-tol-dedup")
+        with w.store.locked():
+            did = w.ready_drill(diff_threshold=5)
+            w.dm.open_window(did, "alice", seconds=600)
+            first = self._mismatch(w.dm, did, "dup", bad=1)
+            self.assertEqual(first["tolerance"]["mismatch_count"], 1)
+            # same correlation id retried (e.g. client retry after timeout):
+            # original outcome, shadow not re-queried, counter unchanged
+            again = self._mismatch(w.dm, did, "dup", bad=1)
+            self.assertTrue(again["replayed"])
+            self.assertEqual(again["tolerance"]["mismatch_count"], 1)
+            stats = w.dm.mirror_stats(did)["stats"]
+            self.assertEqual(stats["mirrored"], 1)
+            self.assertEqual(stats["differences"], 1)
+            w.save()
+        # a replayed deactivation request right after the freeze reads as the
+        # original frozen verdict rather than raising or recounting
+        w2 = self._world("/tmp/kc-tol-dedup2")
+        with w2.store.locked():
+            did = w2.ready_drill(diff_threshold=0)
+            w2.dm.open_window(did, "alice", seconds=600)
+            trig = self._mismatch(w2.dm, did, "trig", bad=1)
+            self.assertTrue(trig["frozen"])
+            replayed = self._mismatch(w2.dm, did, "trig", bad=1)
+            self.assertTrue(replayed["replayed"])
+            self.assertTrue(replayed["frozen"])
+            self.assertEqual(replayed["tolerance"]["mismatch_count"], 1)
+            with self.assertRaises(DrillFrozen):
+                w2.dm.mirror_request(
+                    did, {"operation": "VERIFY", "key": "other",
+                          "request_id": "new-id",
+                          "_shadow_value_override": {"x": 1}})
+            w2.save()
+
+    def test_concurrent_mismatches_accumulate_once_and_freeze_once(self):
+        w = self._world("/tmp/kc-tol-concurrent")
+        errors = []
+        with w.store.locked():
+            did = w.ready_drill(diff_threshold=5)
+            w.dm.open_window(did, "alice", seconds=600)
+
+        def fire(i):
+            try:
+                with w.store.locked():
+                    self._mismatch(w.dm, did, f"c{i:02d}", bad=i)
+            except DrillFrozen:
+                errors.append(i)
+            except Exception as e:  # pragma: no cover - test failure
+                errors.append(e)
+
+        ts = [threading.Thread(target=fire, args=(i,)) for i in range(20)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        with w.store.locked():
+            view = w.dm.get_drill(did)
+            self.assertEqual(view["tolerance"]["mismatch_count"], 6)
+            self.assertEqual(view["tolerance"]["trigger_request_id"],
+                             view["freeze"]["request_id"])
+            # exactly six comparisons ran (sixth crossed quota=5)
+            self.assertEqual(view["mirror_stats"]["mirrored"], 6)
+            self.assertEqual(len(view["differences"]), 6)
+            rids = [x["request_id"] for x in view["differences"]]
+            self.assertEqual(len(rids), len(set(rids)))
+            self.assertEqual(
+                len([e for e in errors if isinstance(e, int)]), 14)
+            self.assertFalse(
+                [e for e in errors if not isinstance(e, int)], errors)
+            w.save()
+
+    def test_count_survives_restart(self):
+        w = self._world("/tmp/kc-tol-restart")
+        with w.store.locked():
+            did = w.ready_drill(diff_threshold=2)
+            w.dm.open_window(did, "alice", seconds=600)
+            self._mismatch(w.dm, did, "p1", bad=1)
+            self._mismatch(w.dm, did, "p2", bad=2)
+            w.save()
+        with w.store.locked():
+            w.reopen()
+            view = w.dm.get_drill(did)
+            self.assertEqual(view["tolerance"]["quota"], 2)
+            self.assertEqual(view["tolerance"]["mismatch_count"], 2)
+            self.assertIsNone(view["tolerance"]["trigger_request_id"])
+            w.dm.open_window(did, "alice", seconds=600)
+            r = self._mismatch(w.dm, did, "p3", bad=3)
+            self.assertTrue(r["frozen"])
+            self.assertEqual(r["tolerance"]["mismatch_count"], 3)
+            self.assertEqual(r["tolerance"]["trigger_request_id"], "p3")
+            w.save()
+
+    def test_view_response_and_evidence_share_same_triple(self):
+        w = self._world("/tmp/kc-tol-surfaces")
+        with w.store.locked():
+            did = w.ready_drill(diff_threshold=1)
+            w.dm.open_window(did, "alice", seconds=600)
+            self._mismatch(w.dm, did, "s1", bad=1)
+            frozen_resp = self._mismatch(w.dm, did, "s2", bad=2)
+            view = w.dm.get_drill(did)
+            # HTTP-shaped mirror response vs public (page) view
+            self.assertEqual(frozen_resp["tolerance"]["quota"],
+                             view["tolerance"]["quota"])
+            self.assertEqual(frozen_resp["tolerance"]["mismatch_count"],
+                             view["tolerance"]["mismatch_count"])
+            self.assertEqual(frozen_resp["tolerance"]["trigger_request_id"],
+                             view["tolerance"]["trigger_request_id"])
+            self.assertEqual(view["freeze"]["request_id"],
+                             view["tolerance"]["trigger_request_id"])
+            w.dm.resume_after_repair(did, "alice", note="fixed")
+            w.dm.open_window(did, "alice", seconds=600)
+            w.dm.mirror_request(
+                did, {"operation": "VERIFY", "key": "ok",
+                      "request_id": "match"})
+            w.dm.close_window(did, "alice")
+            w.dm.acquire_lease(did, "ctrl-A", "alice", ttl_seconds=300)
+            w.dm.failback(did, "alice")
+            w.dm.archive_differences(did)
+            w.dm.terminate(did, "alice")
+            ev = w.dm.evidence(did)
+            et = ev["mirror"]["tolerance"]
+            self.assertEqual(et["quota"], 1)
+            self.assertEqual(et["mismatch_count"], 2)
+            self.assertIn(
+                et["history"][-1]["request_id"], ("s2",))
+            verdict = verify_evidence(ev)
+            self.assertTrue(verdict["ok"], verdict["problems"])
+            w.save()
+
+
+# ---------------------------------------------------------------------------
 # scenario 7: writes never reach the shadow
 # ---------------------------------------------------------------------------
 class TestWriteIsolation(unittest.TestCase):
@@ -578,7 +804,7 @@ class TestWriteIsolation(unittest.TestCase):
                     self.w.dm.mirror_request(
                         did, {"operation": op, "mirror_to_shadow": True,
                               "request_id": "forge-" + op})
-            stats = self.w.dm.mirror_stats(did)
+            stats = self.w.dm.mirror_stats(did)["stats"]
             self.assertGreaterEqual(stats["production_only"],
                                     len(WRITE_OPERATIONS))
             # no write was ever mirrored
