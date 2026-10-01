@@ -160,16 +160,97 @@ try:
     print("read-only mirror + write isolation ok")
 
     # ---- 5. difference freezes the drill; resume after repair -----------
+    # the default quota is 0: the first mismatch disables mirroring and the
+    # response carries the identical quota/count/trigger accounting.
     s, fr = call(f"/api/drills/{did}/mirror",
                  {"operation": "VERIFY", "key": "k", "request_id": "diff-1",
                   "_shadow_value_override": {"bad": True}}, TOKENS["diego"])
     assert s == 200 and fr["frozen"], (s, fr)
+    assert fr["tolerance"] == {"diff_threshold": 0, "mismatch_count": 1,
+                               "trigger_request_id": "diff-1",
+                               "frozen": True}, fr["tolerance"]
     s, gd = call(f"/api/drills/{did}", token=TOKENS["alice"])
     assert gd["status"] == "FROZEN"
+    assert gd["tolerance"] == fr["tolerance"]
+    assert gd["freeze"]["request_id"] == "diff-1"
+    s, ms = call(f"/api/drills/{did}/mirror-stats", token=TOKENS["alice"])
+    assert ms["stats"]["tolerance"] == fr["tolerance"], ms
     s, _ = call(f"/api/drills/{did}/resume", {"note": "shadow repaired"},
                 TOKENS["diego"])
     assert s == 200
     print("difference freeze + resume ok")
+
+    # ---- 5b. quota must be a non-negative integer (HTTP validation) -----
+    for bad in (-1, "3", 3.5, True):
+        s, bad_resp = call("/api/drill-plans",
+                           dict(plan_body, diff_threshold=bad,
+                                label=f"bad quota {bad!r}"),
+                           TOKENS["alice"])
+        assert s == 422 and bad_resp["error"] == "POLICY_VIOLATION", \
+            (bad, s, bad_resp)
+    print("negative/non-integer tolerance quota rejected over HTTP ok")
+
+    # ---- 5c. quota 3: three mismatches tolerated, fourth freezes; the
+    # count is continuous after a manual lift and replays never recount ----
+    s, qplan = call("/api/drill-plans",
+                    dict(plan_body, diff_threshold=3, label="quota 3"),
+                    TOKENS["alice"])
+    assert s == 200 and qplan["fields"]["diff_threshold"] == 3
+    qpid = qplan["id"]
+    s, _ = call(f"/api/drill-plans/{qpid}/scan", {}, TOKENS["alice"])
+    assert s == 200
+    s, qdrill = call(f"/api/drill-plans/{qpid}/start", {}, TOKENS["diego"])
+    assert s == 200
+    qdid = qdrill["id"]
+    for _ in range(8):
+        s, v = call(f"/api/drills/{qdid}/run-to-ready", {}, TOKENS["diego"])
+        if v["status"] == "READY":
+            break
+    assert v["status"] == "READY"
+    s, _ = call(f"/api/drills/{qdid}/window", {"seconds": 600},
+                TOKENS["diego"])
+    assert s == 200
+    for i in range(1, 4):
+        s, tr = call(f"/api/drills/{qdid}/mirror",
+                     {"operation": "VERIFY", "key": "q",
+                      "request_id": f"q-diff-{i}",
+                      "_shadow_value_override": {"bad": i}}, TOKENS["diego"])
+        assert s == 200 and tr["tolerated"] and not tr["frozen"], (s, tr)
+        assert tr["tolerance"]["mismatch_count"] == i
+        assert tr["tolerance"]["diff_threshold"] == 3
+        assert tr["tolerance"]["trigger_request_id"] is None
+    # a replay of the first mismatch is not counted again
+    s, rep = call(f"/api/drills/{qdid}/mirror",
+                  {"operation": "VERIFY", "key": "q", "request_id": "q-diff-1",
+                   "_shadow_value_override": {"bad": 1}}, TOKENS["diego"])
+    assert s == 200 and rep["replay"] and not rep["frozen"]
+    assert rep["tolerance"]["mismatch_count"] == 3
+    # the fourth DISTINCT mismatch freezes with the trigger correlation id
+    s, fq = call(f"/api/drills/{qdid}/mirror",
+                 {"operation": "VERIFY", "key": "q", "request_id": "q-diff-4",
+                  "_shadow_value_override": {"bad": 4}}, TOKENS["diego"])
+    assert s == 200 and fq["frozen"]
+    assert fq["tolerance"] == {"diff_threshold": 3, "mismatch_count": 4,
+                               "trigger_request_id": "q-diff-4",
+                               "frozen": True}
+    s, gd = call(f"/api/drills/{qdid}", token=TOKENS["alice"])
+    assert gd["tolerance"] == fq["tolerance"]
+    s, _ = call(f"/api/drills/{qdid}/resume", {"note": "repaired"},
+                TOKENS["diego"])
+    assert s == 200
+    # after the lift the counter is continuous (not reset): a new mismatch
+    # immediately exceeds the quota again
+    s, fq2 = call(f"/api/drills/{qdid}/mirror",
+                  {"operation": "VERIFY", "key": "q", "request_id": "q-diff-5",
+                   "_shadow_value_override": {"bad": 5}}, TOKENS["diego"])
+    assert s == 200 and fq2["frozen"]
+    assert fq2["tolerance"]["mismatch_count"] == 5
+    assert fq2["tolerance"]["trigger_request_id"] == "q-diff-5"
+    s, _ = call(f"/api/drills/{qdid}/resume", {"note": "repaired"},
+                TOKENS["diego"])
+    s, _ = call(f"/api/drills/{qdid}/window", {"close": True},
+                TOKENS["diego"])
+    print("tolerance quota 3 + replay + continuous-after-lift ok")
 
     # ---- 6. lease: close window, single holder under contention ---------
     s, _ = call(f"/api/drills/{did}/window", {"close": True},

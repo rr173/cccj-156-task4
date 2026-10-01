@@ -542,7 +542,10 @@ class Handler(BaseHTTPRequestHandler):
             "rto_seconds": int(b["rto_seconds"]),
             "rpo_seconds": int(b["rpo_seconds"]),
             "mirror_ratio": float(b.get("mirror_ratio", 0.1)),
-            "diff_threshold": int(b.get("diff_threshold", 1)),
+            # passed through uncoerced: the manager validates that the
+            # tolerance quota is a non-negative integer (floats/bools/strings
+            # are rejected instead of silently truncating).
+            "diff_threshold": b.get("diff_threshold", 0),
             "latency_threshold_ms": int(b.get("latency_threshold_ms", 500)),
         }
 

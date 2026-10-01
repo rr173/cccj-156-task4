@@ -89,6 +89,21 @@ def build_evidence(d: dict, service_seed: bytes, clock=time.time) -> dict:
     stats = dict(d["mirror"]["stats"])
     mirror = {
         "stats": stats,
+        "tolerance": {
+            "diff_threshold": d["fields"]["diff_threshold"],
+            "mismatch_count": d["mirror"].get("mismatch_count",
+                                               len(d["mirror"]["differences"])),
+            "trigger_request_id": (
+                (d["mirror"]["freeze_events"][-1]["request_id"]
+                 if d["mirror"].get("freeze_events") else None)),
+        },
+        "freeze_events": [
+            {"request_id": e["request_id"], "reason": e["reason"],
+             "at": e["at"], "diff_threshold": e["diff_threshold"],
+             "mismatch_count": e["mismatch_count"],
+             "resumed_at": e.get("resumed_at"), "resumed_by": e.get("resumed_by")}
+            for e in d["mirror"].get("freeze_events", [])
+        ],
         "window": d.get("window"),
         "requests": [
             {"request_id": r["request_id"], "operation": r["operation"],
@@ -101,6 +116,7 @@ def build_evidence(d: dict, service_seed: bytes, clock=time.time) -> dict:
         "differences": [
             {"request_id": x["request_id"], "operation": x["operation"],
              "at": x["at"], "differences": x["differences"],
+             "mismatch_number": x.get("mismatch_number"),
              "production_result_hash": x["production_result_hash"],
              "shadow_result_hash": x["shadow_result_hash"],
              "archived": x.get("archived", False)}
@@ -340,6 +356,71 @@ def verify_evidence(ev: dict, *, expect_final_status: str | None = None,
             problems.append(
                 "mirror stats inconsistent: matched+differences exceed "
                 "mirrored total")
+
+    # 5b. mismatch tolerance accounting: the accumulated count must equal the
+    # distinct difference records (no double counting, no gaps), the quota is
+    # a non-negative integer, and every freeze event's quota/count/trigger
+    # correlation id must agree with the difference record at that tally.
+    tol = mirror.get("tolerance")
+    if tol is not None:
+        diffs = mirror.get("differences", [])
+        quota = tol.get("diff_threshold", 0)
+        if not isinstance(quota, int) or isinstance(quota, bool) or quota < 0:
+            problems.append(
+                "mirror tolerance quota must be a non-negative integer")
+        rids = [x.get("request_id") for x in diffs]
+        if len(rids) != len(set(rids)):
+            problems.append(
+                "mirror differences contain a repeated request correlation "
+                "id (the same mismatch was counted twice)")
+        if tol.get("mismatch_count") != len(diffs):
+            problems.append(
+                "mirror tolerance mismatch_count disagrees with the number "
+                "of difference records (count not continuous or double "
+                "counted)")
+        # difference records carry the continuous 1-based tally at which each
+        # mismatch was first seen: the numbers form a gap-free sequence.
+        numbers = [x.get("mismatch_number") for x in diffs]
+        present = sorted(n for n in numbers if n is not None)
+        if present and present != list(range(1, len(present) + 1)):
+            problems.append(
+                "mirror mismatch numbers are not a continuous 1-based "
+                "sequence")
+        events = mirror.get("freeze_events", [])
+        by_rid = {x.get("request_id"): x for x in diffs}
+        for e in events:
+            n = e.get("mismatch_count")
+            eq = e.get("diff_threshold", quota)
+            if not isinstance(n, int) or not isinstance(eq, int) or n <= eq:
+                problems.append(
+                    f"freeze event {e.get('request_id')} was recorded before "
+                    "the mismatch count exceeded the tolerance quota")
+                continue
+            rid = e.get("request_id")
+            rec = by_rid.get(rid)
+            if rec is None:
+                problems.append(
+                    f"freeze trigger correlation id {rid} is not among the "
+                    "recorded differences")
+            elif rec.get("mismatch_number") != n:
+                problems.append(
+                    f"freeze trigger {rid} tally {n} disagrees with the "
+                    "difference record's mismatch number")
+            if eq != quota:
+                problems.append(
+                    f"freeze event {rid} quota disagrees with the tolerance "
+                    "configuration")
+        if tol.get("trigger_request_id") != (
+                events[-1].get("request_id") if events else None):
+            problems.append(
+                "tolerance trigger correlation id does not match the latest "
+                "freeze event")
+        # if the total never exceeded the quota, mirroring must never have
+        # frozen (converse is already covered per event above)
+        if not events and len(diffs) > quota:
+            problems.append(
+                "mismatch count exceeded the tolerance quota but no freeze "
+                "event was recorded")
 
     # 6. lease history: at most one held interval, no overlap
     lease = ev.get("lease")

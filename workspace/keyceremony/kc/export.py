@@ -143,7 +143,24 @@ def _public_drill(d: dict) -> dict:
             "probes", "window", "mirror", "lease", "failback", "cleanup",
             "freeze", "evidence_id", "rto_observed_seconds",
             "rto_breached", "created_at", "ready_at", "fields")
-    return _strip_secrets({k: d.get(k) for k in keep})
+    out = _strip_secrets({k: d.get(k) for k in keep})
+    # Surface the mismatch tolerance accounting derived from the raw record
+    # so the audit package shows the same quota / current count / triggering
+    # correlation id as the console and the HTTP responses.
+    mirror = d.get("mirror") or {}
+    fields = d.get("fields") or {}
+    events = mirror.get("freeze_events") or []
+    freeze = d.get("freeze")
+    trigger = freeze["request_id"] if freeze else (
+        events[-1]["request_id"] if events else None)
+    count = mirror.get("mismatch_count", len(mirror.get("differences", [])))
+    out["tolerance"] = {
+        "diff_threshold": fields.get("diff_threshold", 0),
+        "mismatch_count": count,
+        "trigger_request_id": trigger,
+        "frozen": d.get("status") == "FROZEN",
+    }
+    return out
 
 
 def write_export(orch, outdir: str) -> str:

@@ -226,6 +226,9 @@
       <input id="drRpo" placeholder="rpo_s" value="3600" style="width:90px"/>
       <input id="drRatio" placeholder="mirror_ratio" value="0.1"
              style="width:100px"/>
+      <input id="drDiffTol" type="number" min="0" step="1" value="0"
+             placeholder="mismatch tolerance" title="non-negative integer: mismatches tolerated before the shadow is frozen (0 = freeze on first mismatch)"
+             style="width:150px"/>
       <input id="drCats" placeholder="categories" style="flex:1"
              value="key_material,public_keys,audit,index,policy"/>
     </div>
@@ -586,14 +589,18 @@ async function loadDrills() {
       `<tr><td><small><a href="#" onclick="document.getElementById('drillId').value='${x.id}';return false">${x.id}</a></small></td>
        <td>${pill(x.status)}</td><td><small>${x.namespace}</small></td>
        <td>${x.checkpoints.map(c=>c.stage).join("→")||"—"}</td>
-       <td>${x.mirror_stats.mirrored||0} mir / ${x.mirror_stats.matched||0} ok / ${x.mirror_stats.differences||0} diff</td>
+       <td><small>${x.mirror_stats.mirrored||0} mir / ${x.mirror_stats.matched||0} ok<br>
+         mismatch ${(x.tolerance&&x.tolerance.mismatch_count)||0}/${(x.tolerance&&x.tolerance.diff_threshold)??"—"}
+         ${x.tolerance&&x.tolerance.trigger_request_id?"<br>⛔ "+x.tolerance.trigger_request_id:""}
+         ${x.freeze&&x.freeze.resumed_at?"<br>(lifted)":""}</small></td>
        <td>${x.lease?x.lease.status+" ("+x.lease.holder_instance+")":"—"}</td>
        <td>${x.evidence_id?"ev ✓":"—"}</td></tr>`).join("");
     document.getElementById("drillsView").innerHTML =
       `<table><tr><th>plan</th><th>rev</th><th>status</th><th>regions</th>
         <th>recovery point</th><th>categories</th><th>drill</th></tr>${rowsP}</table>
        <table style="margin-top:8px"><tr><th>drill</th><th>status</th>
-        <th>namespace</th><th>checkpoints</th><th>mirror</th><th>lease</th>
+        <th>namespace</th><th>checkpoints</th><th>mirror mismatches/quota · trigger</th>
+        <th>lease</th>
         <th>evidence</th></tr>${rowsD}</table>`;
   } catch (e) { /* duty may not read drills */ }
 }
@@ -634,7 +641,8 @@ function _planBody() {
       .map(s=>s.trim()).filter(Boolean),
     rto_seconds: parseInt(document.getElementById("drRto").value),
     rpo_seconds: parseInt(document.getElementById("drRpo").value),
-    mirror_ratio: parseFloat(document.getElementById("drRatio").value)};
+    mirror_ratio: parseFloat(document.getElementById("drRatio").value),
+    diff_threshold: parseInt(document.getElementById("drDiffTol").value, 10)};
 }
 async function drSavePlan() {
   try {
@@ -690,7 +698,12 @@ async function drMirror() {
     let req = {};
     try { req = JSON.parse(document.getElementById("drReq").value); }
     catch(_) { return toast("request JSON invalid", "err"); }
-    drShow(await api(`/api/drills/${did()}/mirror`, "POST", req));
+    const r = await api(`/api/drills/${did()}/mirror`, "POST", req);
+    drShow(r);
+    if (r.frozen)
+      toast(`FROZEN at mismatch ${r.tolerance.mismatch_count}/${r.tolerance.diff_threshold} by ${r.tolerance.trigger_request_id} — repair then resume`, "err");
+    else if (r.tolerated)
+      toast(`mismatch tolerated: ${r.tolerance.mismatch_count}/${r.tolerance.diff_threshold}${r.replay?" (replay, not recounted)":""}`, "");
   } catch (e) {
     if (e.error === "DRILL_FROZEN") toast("drill FROZEN — repair then resume", "err");
     else if (e.error === "POLICY_VIOLATION")

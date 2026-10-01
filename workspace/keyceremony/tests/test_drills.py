@@ -11,8 +11,12 @@ Covers the ten acceptance scenarios:
      fixed blueprint;
   5. recovery engine crashes across multiple stages: checkpoints resume and
      no resource/object is created or counted twice;
-  6. response difference or latency breach during mirroring auto-freezes the
-     drill; after repair it continues from the freeze point;
+  6. response difference or latency breach during mirroring is accumulated
+     against the plan's non-negative integer tolerance quota: mirroring
+     auto-freezes only once the distinct-mismatch tally exceeds the quota;
+     the tally stays continuous and de-duplicated across concurrency,
+     restarts and manual resumes, after which it continues from the freeze
+     point;
   7. write requests never reach the shadow, even with a forged mirror marker;
   8. two control instances contend for the failover lease: at most one wins;
      failback stays idempotent after the lease lapses;
@@ -488,7 +492,7 @@ class TestStageResume(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# scenario 6: difference freeze + resume
+# scenario 6: mismatch tolerance quota, freeze + resume
 # ---------------------------------------------------------------------------
 class TestMirrorFreeze(unittest.TestCase):
     def setUp(self):
@@ -553,6 +557,276 @@ class TestMirrorFreeze(unittest.TestCase):
                 self.w.dm.mirror_request(
                     did, {"operation": "VERIFY", "key": "k",
                           "request_id": "out", "mirror_to_shadow": True})
+            self.w.save()
+
+
+class TestMismatchTolerance(unittest.TestCase):
+    """The tolerance quota: non-negative integer; the mismatch tally is
+    accumulated atomically and disables mirroring only once it EXCEEDS the
+    quota; the count stays continuous and de-duplicated across concurrency,
+    restarts and manual lifts."""
+
+    def setUp(self):
+        self.w = DrillWorld("/tmp/kc-drill-tolerance")
+
+    def _ready(self, quota):
+        plan = self.w.make_plan(diff_threshold=quota)
+        self.w.dm.scan(plan["id"], "alice")
+        d = self.w.dm.start_drill(plan["id"], "alice")
+        self.w.dm.run_to_ready(d["id"])
+        self.w.dm.open_window(d["id"], "alice", seconds=600)
+        return d["id"]
+
+    def _bad(self, did, rid, i):
+        return {"operation": "VERIFY", "key": "k", "request_id": rid,
+                "_shadow_value_override": {"bad": i}}
+
+    def test_quota_must_be_non_negative_integer(self):
+        with self.w.store.locked():
+            for bad in (-1, -3, "3", 1.5, True, 3.0):
+                with self.assertRaises(PolicyViolation):
+                    self.w.dm.create_plan(
+                        self.w.fields(diff_threshold=bad), "alice")
+            for good in (0, 1, 3):
+                p = self.w.dm.create_plan(
+                    self.w.fields(diff_threshold=good), "alice")
+                self.assertEqual(p["fields"]["diff_threshold"], good)
+                self.assertIs(type(p["fields"]["diff_threshold"]), int)
+            self.w.save()
+
+    def test_quota_zero_freezes_on_first_mismatch(self):
+        with self.w.store.locked():
+            did = self._ready(0)
+            r = self.w.dm.mirror_request(did, self._bad(did, "z1", 1))
+            self.assertTrue(r["frozen"])
+            self.assertEqual(r["tolerance"]["diff_threshold"], 0)
+            self.assertEqual(r["tolerance"]["mismatch_count"], 1)
+            self.assertEqual(r["tolerance"]["trigger_request_id"], "z1")
+            self.assertEqual(self.w.dm.get_drill(did)["status"], DRILL_FROZEN)
+            self.w.save()
+
+    def test_quota_one_tolerates_one_freezes_on_second(self):
+        with self.w.store.locked():
+            did = self._ready(1)
+            r1 = self.w.dm.mirror_request(did, self._bad(did, "q1", 1))
+            self.assertTrue(r1["tolerated"])
+            self.assertFalse(r1["frozen"])
+            self.assertIsNone(r1["tolerance"]["trigger_request_id"])
+            self.assertEqual(r1["tolerance"]["mismatch_count"], 1)
+            r2 = self.w.dm.mirror_request(did, self._bad(did, "q2", 2))
+            self.assertTrue(r2["frozen"])
+            self.assertEqual(r2["tolerance"]["mismatch_count"], 2)
+            self.assertEqual(r2["tolerance"]["trigger_request_id"], "q2")
+            fz = self.w.dm.get_drill(did)["freeze"]
+            self.assertEqual(fz["request_id"], "q2")
+            self.assertEqual(fz["diff_threshold"], 1)
+            self.assertEqual(fz["mismatch_count"], 2)
+            self.w.save()
+
+    def test_quota_three_tolerates_three_fourth_freezes(self):
+        with self.w.store.locked():
+            did = self._ready(3)
+            for i in range(1, 4):
+                r = self.w.dm.mirror_request(
+                    did, self._bad(did, f"m{i}", i))
+                self.assertTrue(r["tolerated"])
+                self.assertFalse(r["frozen"])
+                self.assertEqual(r["tolerance"]["mismatch_count"], i)
+                self.assertEqual(r["tolerance"]["diff_threshold"], 3)
+            d = self.w.dm.get_drill(did)
+            self.assertNotEqual(d["status"], DRILL_FROZEN)
+            r = self.w.dm.mirror_request(did, self._bad(did, "m4", 4))
+            self.assertTrue(r["frozen"])
+            self.assertEqual(r["tolerance"]["mismatch_count"], 4)
+            self.assertEqual(r["tolerance"]["trigger_request_id"], "m4")
+            # the public drill view reports the identical accounting
+            view = self.w.dm.get_drill(did)
+            self.assertEqual(view["tolerance"], r["tolerance"])
+            self.assertEqual(self.w.dm.mirror_stats(did)["tolerance"],
+                             r["tolerance"])
+            self.w.save()
+
+    def test_same_correlation_id_counted_once(self):
+        with self.w.store.locked():
+            did = self._ready(3)
+            r1 = self.w.dm.mirror_request(did, self._bad(did, "dup", 1))
+            r2 = self.w.dm.mirror_request(did, self._bad(did, "dup", 2))
+            self.assertTrue(r2["replay"])
+            self.assertEqual(r2["tolerance"]["mismatch_count"], 1)
+            diffs = self.w.o.state["drills"][did]["mirror"]["differences"]
+            self.assertEqual([x["request_id"] for x in diffs], ["dup"])
+            self.w.save()
+
+    def test_concurrent_mismatches_counted_exactly_once(self):
+        """8 threads racing with DISTINCT ids tally exactly 8; the same id
+        racing concurrently is still counted once (store lock is atomic)."""
+        with self.w.store.locked():
+            did = self._ready(100)
+            errors = []
+
+            def fire(rid):
+                try:
+                    with self.w.store.locked():
+                        self.w.dm.mirror_request(
+                            did, self._bad(did, rid, rid))
+                except Exception as e:  # noqa: BLE001
+                    errors.append((rid, type(e).__name__))
+
+            # release the outer lock so worker threads can acquire it
+        threads = [threading.Thread(target=fire, args=(f"c{i}",))
+                   for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        with self.w.store.locked():
+            self.assertEqual(errors, [])
+            self.assertEqual(self.w.dm.get_drill(did)["status"],
+                             DRILL_OBSERVING)
+            stats = self.w.dm.mirror_stats(did)
+            self.assertEqual(stats["tolerance"]["mismatch_count"], 8)
+            self.assertEqual(stats["differences"], 8)
+
+            # same correlation id fired concurrently -> a single count
+            did2 = self._ready(100)
+
+        def fire_same(_):
+            with self.w.store.locked():
+                self.w.dm.mirror_request(
+                    did2, self._bad(did2, "same", _))
+
+        ts = [threading.Thread(target=fire_same, args=(i,))
+              for i in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        with self.w.store.locked():
+            self.assertEqual(
+                self.w.dm.mirror_stats(did2)["tolerance"]["mismatch_count"],
+                1)
+            self.w.save()
+
+    def test_count_continuous_across_restart(self):
+        with self.w.store.locked():
+            did = self._ready(3)
+            for i in range(1, 5):
+                self.w.dm.mirror_request(did, self._bad(did, f"m{i}", i))
+            self.assertEqual(
+                self.w.dm.get_drill(did)["tolerance"]["mismatch_count"], 4)
+            self.assertEqual(
+                self.w.dm.get_drill(did)["tolerance"]["trigger_request_id"],
+                "m4")
+            self.w.save()
+        # full process-style reload from disk (fresh managers)
+        with self.w.store.locked():
+            self.w.reopen()
+            view = self.w.dm.get_drill(did)
+            self.assertEqual(view["tolerance"]["mismatch_count"], 4)
+            self.assertEqual(view["tolerance"]["trigger_request_id"], "m4")
+            self.assertEqual(view["freeze"]["request_id"], "m4")
+            self.w.save()
+
+    def test_count_continuous_after_manual_lift(self):
+        with self.w.store.locked():
+            did = self._ready(3)
+            for i in range(1, 5):
+                self.w.dm.mirror_request(did, self._bad(did, f"m{i}", i))
+            self.assertEqual(self.w.dm.get_drill(did)["status"], DRILL_FROZEN)
+            self.w.dm.resume_after_repair(did, "alice", note="fixed")
+            # the tally was NOT reset: a replay doesn't recount, a new
+            # mismatch keeps numbering and immediately exceeds the quota
+            replay = self.w.dm.mirror_request(
+                did, self._bad(did, "m1", 1))
+            self.assertTrue(replay["replay"])
+            self.assertEqual(replay["tolerance"]["mismatch_count"], 4)
+            again = self.w.dm.mirror_request(
+                did, self._bad(did, "m5", 5))
+            self.assertTrue(again["frozen"])
+            self.assertEqual(again["tolerance"]["mismatch_count"], 5)
+            self.assertEqual(again["tolerance"]["trigger_request_id"], "m5")
+            # both freeze events survive with their own trigger/quota/count
+            events = self.w.dm.get_drill(did)["freeze_events"]
+            self.assertEqual(
+                [(e["request_id"], e["mismatch_count"], e["diff_threshold"])
+                 for e in events],
+                [("m4", 4, 3), ("m5", 5, 3)])
+            self.w.save()
+
+    def test_evidence_archive_carries_matching_accounting(self):
+        with self.w.store.locked():
+            did = self._ready(3)
+            for i in range(1, 5):
+                self.w.dm.mirror_request(did, self._bad(did, f"m{i}", i))
+            self.w.dm.resume_after_repair(did, "alice")
+            self.w.dm.close_window(did, "alice")
+            self.w.dm.archive_differences(did)
+            self.w.dm.cleanup(did)
+            ev = self.w.dm.evidence(did)
+            verdict = verify_evidence(ev)
+            self.assertTrue(verdict["ok"], verdict["problems"])
+            self.assertEqual(ev["mirror"]["tolerance"],
+                             {"diff_threshold": 3, "mismatch_count": 4,
+                              "trigger_request_id": "m4"})
+            self.assertEqual(
+                [x["request_id"] for x in ev["mirror"]["differences"]],
+                ["m1", "m2", "m3", "m4"])
+            self.assertEqual(
+                [x["mismatch_number"]
+                 for x in ev["mirror"]["differences"]],
+                [1, 2, 3, 4])
+            self.w.save()
+
+    def test_evidence_rejects_double_counted_mismatch(self):
+        with self.w.store.locked():
+            did = self._ready(3)
+            for i in range(1, 4):
+                self.w.dm.mirror_request(did, self._bad(did, f"m{i}", i))
+            self.w.dm.close_window(did, "alice")
+            self.w.dm.archive_differences(did)
+            self.w.dm.cleanup(did)
+            ev = self.w.dm.evidence(did)
+            # forge a duplicate difference entry
+            ev["mirror"]["differences"].append(
+                dict(ev["mirror"]["differences"][0]))
+            v = verify_evidence(ev)
+            self.assertFalse(v["ok"])
+            self.assertTrue(any("repeated request correlation id" in p
+                                for p in v["problems"]), v["problems"])
+            self.w.save()
+
+    def test_old_record_backfilled_on_restart(self):
+        """A drill record persisted by older code (no tolerance fields) is
+        backfilled from its difference records: the tally stays continuous
+        and a fresh mismatch exceeds quota 0 immediately."""
+        with self.w.store.locked():
+            did = self._ready(0)
+            self.w.dm.mirror_request(did, self._bad(did, "old1", 1))
+            rec = self.w.o.state["drills"][did]
+            # strip every field introduced by the tolerance change, the way
+            # an older build would have persisted it
+            rec["mirror"].pop("mismatch_count", None)
+            rec["mirror"].pop("counted_request_ids", None)
+            rec["mirror"].pop("freeze_events", None)
+            rec["fields"].pop("diff_threshold", None)
+            n_diff = len(rec["mirror"]["differences"])
+            self.assertEqual(n_diff, 1)
+            self.w.save()
+        with self.w.store.locked():
+            self.w.reopen()
+            view = self.w.dm.get_drill(did)
+            self.assertEqual(view["tolerance"]["diff_threshold"], 0)
+            self.assertEqual(view["tolerance"]["mismatch_count"], 1)
+            self.assertEqual(view["tolerance"]["trigger_request_id"], "old1")
+            self.assertEqual(
+                [e["request_id"] for e in view["freeze_events"]], ["old1"])
+            self.w.dm.resume_after_repair(did, "alice")
+            self.w.dm.open_window(did, "alice", seconds=600)
+            r = self.w.dm.mirror_request(
+                did, self._bad(did, "new1", 2))
+            self.assertTrue(r["frozen"])
+            self.assertEqual(r["tolerance"]["mismatch_count"], 2)
+            self.assertEqual(r["tolerance"]["trigger_request_id"], "new1")
             self.w.save()
 
 

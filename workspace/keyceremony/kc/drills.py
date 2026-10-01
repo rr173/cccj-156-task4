@@ -13,7 +13,10 @@ Lifecycle
       -> scanned: fixed recovery blueprint (+ short-lived creds/namespace)
       -> PREPARE -> COPY -> REBUILD_INDEX -> SHADOW_START -> PROBES -> READY
       -> observation window: read-only mirror traffic, comparator
-      -> (differences: FROZEN -> resume after repair, or terminate)
+      -> (differences: accumulated per request correlation id; mirroring is
+         frozen only once the distinct-mismatch tally EXCEEDS the plan's
+         non-negative integer diff_threshold; resume after repair keeps the
+         tally continuous, or terminate)
       -> leased failover (read-only verification ingress only)
       -> failback (converged state machine; idempotent)
       -> cleanup (resumable; blocked while traffic/lease/unarchived diffs)
@@ -138,6 +141,11 @@ class DrillsManager:
         self.cred_ttl = cred_ttl
         for key in ("drill_plans", "drills"):
             self.state.setdefault(key, {})
+        # Tolerance accounting was added after the original schema: backfill
+        # older persisted drill records so a service restart keeps the tally
+        # available (already-counted differences seed the continuous counter).
+        for d in self.state["drills"].values():
+            self._migrate_drill(d)
 
     # ======================================================================
     # plans (revisioned, optimistic concurrency)
@@ -224,9 +232,25 @@ class DrillsManager:
             "rto_seconds": int(f["rto_seconds"]),
             "rpo_seconds": int(f["rpo_seconds"]),
             "mirror_ratio": float(f.get("mirror_ratio", 0.1)),
-            "diff_threshold": int(f.get("diff_threshold", 1)),
+            "diff_threshold": self._norm_diff_threshold(
+                f.get("diff_threshold", 0)),
             "latency_threshold_ms": int(f.get("latency_threshold_ms", 500)),
         }
+
+    @staticmethod
+    def _norm_diff_threshold(v) -> int:
+        """Tolerance quota: a non-negative integer. Booleans, floats and
+        numeric strings are rejected so the quota can never silently widen
+        (e.g. -1/True) or narrow under coercion."""
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise PolicyViolation(
+                "diff_threshold must be a non-negative integer number of "
+                "tolerated mismatches")
+        if v < 0:
+            raise PolicyViolation(
+                "diff_threshold must be non-negative (0 = freeze on the "
+                "first mismatch)")
+        return v
 
     def _validate_fields(self, f: dict):
         for k in ("label", "source_region", "target_region",
@@ -598,7 +622,17 @@ class DrillsManager:
             "window": None,
             "mirror": {"requests": [], "differences": [], "stats": {
                 "mirrored": 0, "matched": 0, "differences": 0,
-                "timeouts": 0, "production_only": 0}},
+                "timeouts": 0, "production_only": 0},
+                # Mismatch tolerance accounting. mismatch_count is the
+                # authoritative, atomically accumulated tally of DISTINCT
+                # mismatching request correlation ids; mirroring is frozen
+                # only once it exceeds diff_threshold. The dedup set and the
+                # tally persist so the count stays continuous - and never
+                # double counts a retried request - across concurrent
+                # comparisons, process restarts and manual resumes.
+                "mismatch_count": 0,
+                "counted_request_ids": [],
+                "freeze_events": []},
             "lease": None,
             "failback": None,
             "freeze": None,
@@ -623,6 +657,30 @@ class DrillsManager:
         if d is None:
             raise NotFound(f"unknown drill {drill_id}")
         return d
+
+    @staticmethod
+    def _migrate_drill(d: dict):
+        """Backfill tolerance accounting on records written by older code.
+
+        The continuous counter is seeded from the difference records already
+        persisted (one per distinct mismatching correlation id), so a restart
+        never loses or double counts the tally."""
+        d.setdefault("fields", {})
+        if "diff_threshold" not in d["fields"]:
+            d["fields"]["diff_threshold"] = 0
+        m = d.setdefault("mirror", {})
+        m.setdefault("requests", [])
+        m.setdefault("differences", [])
+        m.setdefault("stats", {"mirrored": 0, "matched": 0, "differences": 0,
+                               "timeouts": 0, "production_only": 0})
+        rids = [x["request_id"] for x in m["differences"]]
+        m.setdefault("counted_request_ids", rids)
+        m.setdefault("mismatch_count", len(set(rids)))
+        events = m.setdefault("freeze_events", [])
+        fz = d.get("freeze")
+        if fz and not any(e.get("request_id") == fz.get("request_id")
+                          and e.get("at") == fz.get("at") for e in events):
+            events.append({k: fz[k] for k in fz})
 
     def get_drill(self, drill_id: str) -> dict:
         return self.public_drill(drill_id)
@@ -1101,14 +1159,40 @@ class DrillsManager:
             "differences": diffs,
         }
         if diffs:
-            d["mirror"]["stats"]["differences"] += 1
-            d["mirror"]["differences"].append(cmp_rec)
             record["differences"] = diffs
             d["mirror"]["requests"].append(record)
-            self._freeze(d, reason=diffs[0], request_id=rid)
+            # Atomic accumulation (caller holds the cross-thread/cross-process
+            # store lock): the SAME correlation id is counted at most once,
+            # however often the comparison is retried/replayed.
+            quota = d["fields"]["diff_threshold"]
+            tol = d["mirror"]
+            already = rid in tol["counted_request_ids"]
+            if not already:
+                cmp_rec["mismatch_number"] = tol["mismatch_count"] + 1
+                tol["differences"].append(cmp_rec)
+                tol["counted_request_ids"].append(rid)
+                tol["mismatch_count"] += 1
+                tol["stats"]["differences"] += 1
+            # A replay of an already-counted mismatch never re-triggers a
+            # freeze (the count did not move), even after a manual resume.
+            should_freeze = (not already) and tol["mismatch_count"] > quota
+            # Freeze only when the accumulated tally exceeds the quota. With
+            # quota 0 the first mismatch freezes; quota 1 tolerates exactly
+            # one, the second freezes; and so on.
+            if should_freeze:
+                self._freeze(d, reason=diffs[0], request_id=rid)
+                # rebuild the view after the freeze so it carries the
+                # triggering correlation id and the frozen state
+                return {"request_id": rid, "served_by": "production",
+                        "mirrored": True, "differences": diffs,
+                        "frozen": True, "replay": already,
+                        "tolerance": self._tolerance_view(d),
+                        "result": prod_result["value"]}
             return {"request_id": rid, "served_by": "production",
                     "mirrored": True, "differences": diffs,
-                    "frozen": True, "result": prod_result["value"]}
+                    "frozen": False, "tolerated": True, "replay": already,
+                    "tolerance": self._tolerance_view(d),
+                    "result": prod_result["value"]}
         d["mirror"]["stats"]["matched"] += 1
         d["mirror"]["requests"].append(record)
         return {"request_id": rid, "served_by": "production+shadow",
@@ -1142,14 +1226,44 @@ class DrillsManager:
                 "timeout": bool(timeout)}
 
     # ---- freeze / resume --------------------------------------------------
+    def _tolerance_view(self, d: dict) -> dict:
+        """The single tolerance accounting record shown identically on the
+        console, in HTTP responses and inside the evidence archive: the
+        configured quota, the current accumulated mismatch count, and - once
+        the quota was exceeded - the request correlation id that triggered
+        the (current/latest) freeze."""
+        tol = d["mirror"]
+        trigger = None
+        if tol.get("freeze_events"):
+            trigger = tol["freeze_events"][-1]["request_id"]
+        freeze = d.get("freeze")
+        if freeze is not None:
+            trigger = freeze["request_id"]
+        return {
+            "diff_threshold": d["fields"]["diff_threshold"],
+            "mismatch_count": tol["mismatch_count"],
+            "trigger_request_id": trigger,
+            "frozen": d["status"] == DRILL_FROZEN,
+        }
+
     def _freeze(self, d: dict, *, reason: str, request_id: str):
         d["status"] = DRILL_FROZEN
-        d["freeze"] = {"reason": reason, "request_id": request_id,
-                       "at": _now(self.clock),
-                       "checkpoints": len(d["checkpoints"])}
+        tol = d["mirror"]
+        fz = {"reason": reason, "request_id": request_id,
+              "at": _now(self.clock),
+              "checkpoints": len(d["checkpoints"]),
+              "diff_threshold": d["fields"]["diff_threshold"],
+              "mismatch_count": tol["mismatch_count"]}
+        d["freeze"] = fz
+        # retained across resumes/restarts: every breach keeps its triggering
+        # correlation id, quota and tally without re-numbering later events.
+        # A copy is archived because the live record later gains resume data.
+        tol["freeze_events"].append(dict(fz))
         self.audit.append("drill_frozen",
                           {"drill_id": d["id"], "reason": reason,
-                           "request_id": request_id})
+                           "request_id": request_id,
+                           "diff_threshold": fz["diff_threshold"],
+                           "mismatch_count": fz["mismatch_count"]})
 
     def resume_after_repair(self, drill_id: str, actor: str,
                             *, note: str = "") -> dict:
@@ -1169,14 +1283,21 @@ class DrillsManager:
         fz["resumed_by"] = actor
         fz["repair_note"] = note
         d["status"] = DRILL_READY
+        # The accumulated mismatch tally is deliberately NOT reset: counting
+        # continues from the same value after the manual lift (and survives a
+        # process restart via persisted state).
         self.audit.append("drill_resumed",
                           {"drill_id": drill_id, "actor": actor, "note": note,
-                           "frozen_at": fz["at"]})
+                           "frozen_at": fz["at"],
+                           "diff_threshold": fz["diff_threshold"],
+                           "mismatch_count": fz["mismatch_count"]})
         return self.public_drill(drill_id)
 
     def mirror_stats(self, drill_id: str) -> dict:
         d = self._drill(drill_id)
-        return dict(d["mirror"]["stats"])
+        out = dict(d["mirror"]["stats"])
+        out["tolerance"] = self._tolerance_view(d)
+        return out
 
     # ======================================================================
     # failover lease
@@ -1488,7 +1609,9 @@ class DrillsManager:
                 "closed": d["window"]["closed"],
                 "ratio": d["window"]["ratio"]}),
             "mirror_stats": dict(d["mirror"]["stats"]),
+            "tolerance": self._tolerance_view(d),
             "differences": list(d["mirror"]["differences"]),
+            "freeze_events": [dict(e) for e in d["mirror"]["freeze_events"]],
             "freeze": d.get("freeze"),
             "lease": d.get("lease"),
             "failback": d.get("failback"),
